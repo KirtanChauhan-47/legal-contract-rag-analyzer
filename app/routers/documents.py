@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, File, Query, UploadFile
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
+from app.schemas.chunk import ChunkRead
 from app.schemas.document import DocumentListItem, DocumentRead, DocumentUploadResponse
 from app.services import document_service
 
@@ -35,3 +36,16 @@ def get_document(
     if not include_text:
         data.raw_text = None
     return data
+
+
+@router.post("/{document_id}/process", response_model=DocumentRead)
+def process_document(document_id: int, db: Session = Depends(get_db)):
+    document = document_service.process_document(db, document_id)
+    data = DocumentRead.model_validate(document)
+    data.raw_text = None
+    return data
+
+
+@router.get("/{document_id}/chunks", response_model=list[ChunkRead])
+def get_chunks(document_id: int, db: Session = Depends(get_db)):
+    return document_service.get_chunks(db, document_id)

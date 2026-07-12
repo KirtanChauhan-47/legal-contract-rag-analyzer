@@ -97,13 +97,18 @@ app/
 │                             # (clause_taxonomy.py, auth.py land in later sprints)
 ├── db/                       # base.py (engine/Base), session.py (get_db), init_db.py, repository.py
 ├── models/                    # document.py, chunk.py  (analysis.py, chat.py land in later sprints)
-├── schemas/                    # document.py  (chunk.py, qa.py, clause.py, summary.py land later)
+├── schemas/                    # document.py, chunk.py  (qa.py, clause.py, summary.py land later)
 ├── routers/                     # health.py, documents.py  (qa.py, clauses.py, summary.py land later)
-├── services/                     # llm_service.py (interface + stub only),
-│                                   # extraction_service.py, document_service.py (upload orchestration)
-├── prompts/                       # empty until Sprint 3+
+├── services/                     # llm_service.py (interface + stub only), extraction_service.py,
+│                                   # document_service.py (upload + process orchestration),
+│                                   # contract_gate_service.py, cleaning_service.py, chunking_service.py
+├── prompts/                       # contract_gate_prompt.py
 └── utils/                          # file_validation.py
 ```
+
+`app/db/chunk_repository.py` holds Chunk-specific queries (list-by-document,
+replace-for-document), kept out of the generic `Repository` per its own
+docstring — model-specific query logic gets its own module.
 
 Note: `document_service.py` isn't named in the original sprint plan but follows
 directly from the stated layering rule (routers thin, services orchestrate) —
@@ -144,11 +149,33 @@ files: all three extracted correctly, files persisted to disk, DB rows
 correct, 404 handling correct. Still no gate/cleaning/chunking (Sprint 3),
 embeddings (Sprint 4), or LLM calls (Sprint 5+).
 
-**Next up — Sprint 3 (Legal-Document Gate + Cleaning + Clause-Aware
-Chunking):** heuristic contract-signal pre-filter + LLM-confirmation gate
-for ambiguous cases, deterministic text cleaning, regex/heuristic
-section-boundary chunking with `char_start`/`char_end` offsets into
-`cleaned_text`. Needs `app/services/contract_gate_service.py`,
-`cleaning_service.py`, `chunking_service.py`, `app/schemas/chunk.py`,
-`app/prompts/contract_gate_prompt.py`, plus `POST /documents/{id}/process`
-and `GET /documents/{id}/chunks`.
+**Sprint 3 — COMPLETE.** `POST /documents/{id}/process` runs the gate →
+clean → chunk pipeline; `GET /documents/{id}/chunks` inspects results.
+Contract gate is a two-tier heuristic (keyword/pattern scoring) +
+LLM-confirmation-for-ambiguous-cases design; since `LLMProvider` is still
+stubbed (Sprint 1), ambiguous cases currently fall back to a heuristic-only
+decision via a caught `NotImplementedError` — this will start using real
+Groq confirmation automatically once Sprint 5 wires it up, no code change
+needed here. Cleaning is deterministic (whitespace/hyphenation/quote
+normalization). Chunking detects heading lines (numbered sections,
+Section/Article, ALL-CAPS) to find section boundaries, sub-splits oversized
+sections into overlapping word windows, and falls back to paragraph
+splitting when no structure is found. Re-processing a document replaces
+its chunks rather than accumulating duplicates (`ChunkRepository.
+replace_for_document`).
+
+Verified live: a realistic multi-clause NDA was accepted and chunked into
+10 chunks with correct short section labels (e.g. `"1. Confidentiality."`,
+not the whole clause body — this was caught and fixed during verification,
+since headings and body text often share one line in real contracts); a
+non-contract text (gardening article) was correctly gated-rejected with a
+clear reason; every chunk's `char_start`/`char_end` was verified to slice
+`cleaned_text` back to exactly the stored chunk text.
+
+**Next up — Sprint 4 (Embeddings + Vector Store):** load `all-MiniLM-L6-v2`
+singleton, wrap ChromaDB (single `contract_chunks` collection, metadata-
+filtered by `document_id`), embed chunks and record `embedding_id` back
+onto each `Chunk` row, add a raw semantic-search debug endpoint
+(`GET /documents/{id}/search?q=...`). Needs `app/services/
+embedding_service.py`, `vector_store_service.py`, and
+`sentence-transformers`/`chromadb` uncommented in `requirements.txt`.

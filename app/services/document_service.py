@@ -7,9 +7,12 @@ import uuid as uuid_lib
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.exceptions import NotFoundError
+from app.core.exceptions import ConflictError, NotFoundError
+from app.db.chunk_repository import ChunkRepository
 from app.db.repository import Repository
+from app.models.chunk import Chunk
 from app.models.document import Document, DocumentStatus
+from app.services import chunking_service, cleaning_service, contract_gate_service
 from app.services.extraction_service import ExtractionError, extract_text
 from app.utils.file_validation import validate_upload
 
@@ -61,3 +64,44 @@ def get_document(db: Session, document_id: int) -> Document:
 def list_documents(db: Session, *, offset: int = 0, limit: int = 20) -> list[Document]:
     repo = Repository(db, Document)
     return repo.list(offset=offset, limit=limit)
+
+
+def process_document(db: Session, document_id: int) -> Document:
+    """Runs gate -> clean -> chunk. Safe to call again on an already-processed
+    document (e.g. to retry after tuning) — prior chunks are replaced, not
+    accumulated."""
+    document = get_document(db, document_id)
+
+    if document.status == DocumentStatus.UPLOADED.value:
+        raise ConflictError(f"Document {document_id} has not finished text extraction yet.")
+    if document.status == DocumentStatus.FAILED.value:
+        raise ConflictError(f"Document {document_id} failed extraction: {document.error_message}")
+
+    gate_result = contract_gate_service.run_gate(document.raw_text)
+    document.is_legal_contract = gate_result.is_contract
+    document.rejection_reason = None if gate_result.is_contract else gate_result.reason
+    if gate_result.contract_type:
+        document.contract_type = gate_result.contract_type
+
+    chunk_repo = ChunkRepository(db)
+
+    if not gate_result.is_contract:
+        document.status = DocumentStatus.GATED_REJECTED.value
+        chunk_repo.replace_for_document(document.id, [])
+        db.commit()
+        db.refresh(document)
+        return document
+
+    document.cleaned_text = cleaning_service.clean_text(document.raw_text)
+    chunk_dicts = chunking_service.chunk_document(document.cleaned_text)
+    chunk_repo.replace_for_document(document.id, chunk_dicts)
+
+    document.status = DocumentStatus.CHUNKED.value
+    db.commit()
+    db.refresh(document)
+    return document
+
+
+def get_chunks(db: Session, document_id: int) -> list[Chunk]:
+    get_document(db, document_id)  # raises NotFoundError if missing
+    return ChunkRepository(db).list_by_document(document_id)
