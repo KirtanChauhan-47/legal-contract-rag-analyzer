@@ -1,14 +1,14 @@
-# --- Sprint 1: scaffolding & foundations (installed now) ---
+# --- Sprint 1: scaffolding & foundations ---
 fastapi
 uvicorn[standard]
 sqlalchemy
 pydantic-settings
 python-dotenv
 
-# --- Sprint 2: document ingestion (uncomment when reached) ---
-# python-multipart
-# pymupdf
-# python-docx
+# --- Sprint 2: document ingestion ---
+python-multipart
+pymupdf
+python-docx
 
 # --- Sprint 4: embeddings + vector store ---
 # sentence-transformers

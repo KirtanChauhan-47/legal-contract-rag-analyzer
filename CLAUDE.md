@@ -97,12 +97,18 @@ app/
 │                             # (clause_taxonomy.py, auth.py land in later sprints)
 ├── db/                       # base.py (engine/Base), session.py (get_db), init_db.py, repository.py
 ├── models/                    # document.py, chunk.py  (analysis.py, chat.py land in later sprints)
-├── schemas/                    # Pydantic schemas (empty until Sprint 2)
-├── routers/                     # health.py  (documents.py, qa.py, clauses.py, summary.py land later)
-├── services/                     # llm_service.py (interface + stub only for now)
+├── schemas/                    # document.py  (chunk.py, qa.py, clause.py, summary.py land later)
+├── routers/                     # health.py, documents.py  (qa.py, clauses.py, summary.py land later)
+├── services/                     # llm_service.py (interface + stub only),
+│                                   # extraction_service.py, document_service.py (upload orchestration)
 ├── prompts/                       # empty until Sprint 3+
-└── utils/                          # empty until Sprint 2
+└── utils/                          # file_validation.py
 ```
+
+Note: `document_service.py` isn't named in the original sprint plan but follows
+directly from the stated layering rule (routers thin, services orchestrate) —
+it owns save-to-disk + extraction + DB persistence so `routers/documents.py`
+stays a pure parse-call-return layer.
 
 ## Coding conventions
 
@@ -125,13 +131,24 @@ app/
 **Sprint 1 — COMPLETE.** Project skeleton, FastAPI app, config, SQLAlchemy
 DB setup (`Document`, `Chunk` models), `GET /health`, generic repository
 helper, stubbed `LLMProvider` interface, `requirements.txt`, `.env.example`,
-README, this file. No upload/extraction/embeddings/retrieval/Groq
-calls/clause detection yet — intentionally deferred.
+README, this file.
 
-**Next up — Sprint 2 (Document Ingestion Pipeline):** `POST
-/documents/upload` (multipart validation, save to `data/uploads/`, extract
-text via PyMuPDF/python-docx/plain-read), `GET /documents/{id}`, `GET
-/documents`. Needs `app/schemas/document.py`, `app/routers/documents.py`,
-`app/services/extraction_service.py`, `app/utils/file_validation.py`. Add
-`python-multipart`, `pymupdf`, `python-docx` to `requirements.txt` when
-starting this sprint.
+**Sprint 2 — COMPLETE.** `POST /documents/upload` (multipart upload,
+extension/size/empty-file validation, saved to `data/uploads/{uuid}_{name}`,
+text extracted via PyMuPDF/python-docx/plain-read), `GET /documents/{id}`
+(with `?include_text=true` to fetch full raw text), `GET /documents`
+(paginated list). Extraction failures set `status=failed` +
+`error_message` instead of raising — verified live with a corrupt/rejected
+upload. Verified live end-to-end with real `.txt`/`.docx`/`.pdf` sample
+files: all three extracted correctly, files persisted to disk, DB rows
+correct, 404 handling correct. Still no gate/cleaning/chunking (Sprint 3),
+embeddings (Sprint 4), or LLM calls (Sprint 5+).
+
+**Next up — Sprint 3 (Legal-Document Gate + Cleaning + Clause-Aware
+Chunking):** heuristic contract-signal pre-filter + LLM-confirmation gate
+for ambiguous cases, deterministic text cleaning, regex/heuristic
+section-boundary chunking with `char_start`/`char_end` offsets into
+`cleaned_text`. Needs `app/services/contract_gate_service.py`,
+`cleaning_service.py`, `chunking_service.py`, `app/schemas/chunk.py`,
+`app/prompts/contract_gate_prompt.py`, plus `POST /documents/{id}/process`
+and `GET /documents/{id}/chunks`.
