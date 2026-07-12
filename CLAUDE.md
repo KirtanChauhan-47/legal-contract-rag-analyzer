@@ -172,10 +172,39 @@ non-contract text (gardening article) was correctly gated-rejected with a
 clear reason; every chunk's `char_start`/`char_end` was verified to slice
 `cleaned_text` back to exactly the stored chunk text.
 
-**Next up — Sprint 4 (Embeddings + Vector Store):** load `all-MiniLM-L6-v2`
-singleton, wrap ChromaDB (single `contract_chunks` collection, metadata-
-filtered by `document_id`), embed chunks and record `embedding_id` back
-onto each `Chunk` row, add a raw semantic-search debug endpoint
-(`GET /documents/{id}/search?q=...`). Needs `app/services/
-embedding_service.py`, `vector_store_service.py`, and
-`sentence-transformers`/`chromadb` uncommented in `requirements.txt`.
+**Sprint 4 — COMPLETE.** `POST /documents/{id}/embed` embeds all of a
+document's chunks with a singleton `all-MiniLM-L6-v2` model
+(`app/services/embedding_service.py`) and upserts them into a single
+persistent ChromaDB collection `contract_chunks`
+(`app/services/vector_store_service.py`), metadata-filtered by
+`document_id` (not collection-per-document, per the locked design).
+`embedding_id` (`doc{document_id}_chunk{chunk_id}`) is recorded back onto
+each `Chunk` row. `GET /documents/{id}/search?q=...` is a raw semantic
+search debug endpoint (no LLM). Re-processing or re-embedding a document
+purges its old vectors first (`vector_store_service.
+delete_vectors_for_document`) so nothing orphans or duplicates — this is
+called both when `/process` replaces chunks and at the start of `/embed`.
+Status machine now enforced: `/embed` requires `chunked`/`embedded`
+status, `/search` requires `embedded` status, both via `ConflictError`
+(409).
+
+Verified live: uploaded and processed a real NDA, confirmed `/search`
+returned a 409 before embedding, embedded it, then ran three natural-
+language queries ("how can this agreement be terminated", "what happens
+if there are damages", "which state law applies") — each correctly
+matched its corresponding clause (Term and Termination, Limitation of
+Liability, Governing Law respectively) with a clear distance gap over
+irrelevant chunks, proving real semantic (not keyword) search. Also
+verified re-embedding is idempotent: chunk count and Chroma vector count
+both stayed at 10 after embedding twice — no duplicates.
+
+**Next up — Sprint 5 (Retrieval + RAG Q&A):** `POST /documents/{id}/ask`
+— retrieve top-k chunks via `vector_store_service.query` (already built),
+build a grounded prompt, call the LLM through `get_llm_provider()` (real
+Groq implementation replaces `StubLLMProvider` here), parse structured
+JSON `{answer, citations}`, verify each citation's quote actually appears
+in its cited chunk, persist to new `ChatSession`/`ChatMessage` tables.
+Needs `app/services/retrieval_service.py`, `qa_service.py`,
+`app/prompts/qa_prompt.py`, `app/models/chat.py`, `app/schemas/qa.py`,
+and `groq` uncommented in `requirements.txt` + a real `GroqLLMProvider`
+added to `llm_service.py`.

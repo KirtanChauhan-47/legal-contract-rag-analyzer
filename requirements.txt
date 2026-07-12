@@ -11,8 +11,8 @@ pymupdf
 python-docx
 
 # --- Sprint 4: embeddings + vector store ---
-# sentence-transformers
-# chromadb
+sentence-transformers
+chromadb
 
 # --- Sprint 5+: LLM generation ---
 # groq

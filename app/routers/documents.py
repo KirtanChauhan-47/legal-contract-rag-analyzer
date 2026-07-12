@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, File, Query, UploadFile
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
-from app.schemas.chunk import ChunkRead
+from app.schemas.chunk import ChunkRead, ChunkSearchResult
 from app.schemas.document import DocumentListItem, DocumentRead, DocumentUploadResponse
 from app.services import document_service
 
@@ -49,3 +49,21 @@ def process_document(document_id: int, db: Session = Depends(get_db)):
 @router.get("/{document_id}/chunks", response_model=list[ChunkRead])
 def get_chunks(document_id: int, db: Session = Depends(get_db)):
     return document_service.get_chunks(db, document_id)
+
+
+@router.post("/{document_id}/embed", response_model=DocumentRead)
+def embed_document(document_id: int, db: Session = Depends(get_db)):
+    document = document_service.embed_document(db, document_id)
+    data = DocumentRead.model_validate(document)
+    data.raw_text = None
+    return data
+
+
+@router.get("/{document_id}/search", response_model=list[ChunkSearchResult])
+def search_document(
+    document_id: int,
+    q: str = Query(..., min_length=1, description="Query text to semantically search for."),
+    top_k: int = Query(5, ge=1, le=20),
+    db: Session = Depends(get_db),
+):
+    return document_service.search_document(db, document_id, q, top_k=top_k)

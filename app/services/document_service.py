@@ -13,6 +13,7 @@ from app.db.repository import Repository
 from app.models.chunk import Chunk
 from app.models.document import Document, DocumentStatus
 from app.services import chunking_service, cleaning_service, contract_gate_service
+from app.services import embedding_service, vector_store_service
 from app.services.extraction_service import ExtractionError, extract_text
 from app.utils.file_validation import validate_upload
 
@@ -85,6 +86,12 @@ def process_document(db: Session, document_id: int) -> Document:
 
     chunk_repo = ChunkRepository(db)
 
+    # Replacing chunks invalidates any previously embedded vectors for this
+    # document (old chunk_ids no longer exist) — purge them so re-processing
+    # never leaves orphaned vectors behind (guardrail: vectors + SQL rows
+    # stay in sync).
+    vector_store_service.delete_vectors_for_document(document.id)
+
     if not gate_result.is_contract:
         document.status = DocumentStatus.GATED_REJECTED.value
         chunk_repo.replace_for_document(document.id, [])
@@ -105,3 +112,45 @@ def process_document(db: Session, document_id: int) -> Document:
 def get_chunks(db: Session, document_id: int) -> list[Chunk]:
     get_document(db, document_id)  # raises NotFoundError if missing
     return ChunkRepository(db).list_by_document(document_id)
+
+
+def embed_document(db: Session, document_id: int) -> Document:
+    """Embeds all of a document's chunks and upserts them into the vector
+    store. Safe to call again (e.g. after re-processing) — old vectors for
+    the document are purged first, never accumulated."""
+    document = get_document(db, document_id)
+
+    if document.status not in (DocumentStatus.CHUNKED.value, DocumentStatus.EMBEDDED.value):
+        raise ConflictError(
+            f"Document {document_id} must be chunked before embedding (current status: '{document.status}')."
+        )
+
+    chunk_repo = ChunkRepository(db)
+    chunks = chunk_repo.list_by_document(document_id)
+    if not chunks:
+        raise ConflictError(f"Document {document_id} has no chunks to embed.")
+
+    embeddings = embedding_service.embed_texts([chunk.text for chunk in chunks])
+
+    vector_store_service.delete_vectors_for_document(document_id)
+    vector_store_service.upsert_chunks(document_id, chunks, embeddings)
+
+    for chunk in chunks:
+        chunk.embedding_id = f"doc{document_id}_chunk{chunk.id}"
+
+    document.status = DocumentStatus.EMBEDDED.value
+    db.commit()
+    db.refresh(document)
+    return document
+
+
+def search_document(db: Session, document_id: int, query_text: str, *, top_k: int = 5) -> list[dict]:
+    document = get_document(db, document_id)
+
+    if document.status != DocumentStatus.EMBEDDED.value:
+        raise ConflictError(
+            f"Document {document_id} is not embedded yet (current status: '{document.status}')."
+        )
+
+    query_embedding = embedding_service.embed_texts([query_text])[0]
+    return vector_store_service.query(document_id, query_embedding, top_k)

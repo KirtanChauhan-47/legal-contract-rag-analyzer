@@ -11,3 +11,10 @@ class ChunkRead(BaseModel):
     char_end: int
     section_label: str | None
     token_count: int | None
+
+
+class ChunkSearchResult(BaseModel):
+    chunk_id: int
+    text: str
+    section_label: str | None
+    distance: float
