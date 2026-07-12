@@ -1,0 +1,22 @@
+# --- Sprint 1: scaffolding & foundations (installed now) ---
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic-settings
+python-dotenv
+
+# --- Sprint 2: document ingestion (uncomment when reached) ---
+# python-multipart
+# pymupdf
+# python-docx
+
+# --- Sprint 4: embeddings + vector store ---
+# sentence-transformers
+# chromadb
+
+# --- Sprint 5+: LLM generation ---
+# groq
+
+# --- Sprint 8: testing ---
+# pytest
+# httpx
