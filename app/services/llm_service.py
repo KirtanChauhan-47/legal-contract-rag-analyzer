@@ -1,9 +1,8 @@
 """LLM provider abstraction.
 
-No concrete provider (Groq/Gemini/OpenAI) is wired in yet — that happens in
-the RAG/Q&A sprint. Every other service must depend on the `LLMProvider`
-interface only, never import a provider SDK directly, so the underlying
-model can be swapped without touching business logic.
+Every other service depends on the `LLMProvider` interface only, never a
+provider SDK directly, so the underlying model can be swapped (Groq ->
+Gemini/OpenAI) without touching business logic.
 """
 import abc
 
@@ -18,26 +17,49 @@ class LLMProvider(abc.ABC):
 
 
 class StubLLMProvider(LLMProvider):
-    """Placeholder provider used until real LLM integration lands.
+    """Placeholder provider used when no real LLM is configured.
 
     Raising here (rather than returning canned text) makes it obvious at
-    call time if something tries to use LLM generation before it exists.
+    call time if something tries to use LLM generation before it's set up.
     """
 
     def generate(self, prompt: str, *, system: str | None = None) -> str:
         raise NotImplementedError(
-            "LLM generation is not wired up yet (Sprint 1 scaffolding only). "
-            "Real provider integration (Groq) lands in the RAG/Q&A sprint."
+            "LLM generation is not wired up (LLM_PROVIDER=stub). Set "
+            "LLM_PROVIDER=groq and GROQ_API_KEY in .env to use real generation."
         )
 
 
-def get_llm_provider() -> LLMProvider:
-    """Factory selecting the configured provider.
+class GroqLLMProvider(LLMProvider):
+    """Real Groq-backed provider. The groq SDK is imported only here, never
+    at module level elsewhere, keeping the rest of the app provider-agnostic."""
 
-    Only 'stub' is implemented today; 'groq'/'gemini'/'openai' will be added
-    as concrete LLMProvider subclasses behind this same factory later.
-    """
+    def __init__(self, api_key: str, model: str):
+        from groq import Groq
+
+        self._client = Groq(api_key=api_key)
+        self._model = model
+
+    def generate(self, prompt: str, *, system: str | None = None) -> str:
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        response = self._client.chat.completions.create(
+            model=self._model,
+            messages=messages,
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+        return response.choices[0].message.content
+
+
+def get_llm_provider() -> LLMProvider:
+    """Factory selecting the configured provider via LLM_PROVIDER."""
     settings = get_settings()
     if settings.llm_provider == "stub":
         return StubLLMProvider()
+    if settings.llm_provider == "groq":
+        return GroqLLMProvider(api_key=settings.groq_api_key, model=settings.groq_model)
     raise NotImplementedError(f"LLM provider '{settings.llm_provider}' is not implemented yet.")

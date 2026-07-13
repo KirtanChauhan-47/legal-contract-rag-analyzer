@@ -13,7 +13,7 @@ from app.db.repository import Repository
 from app.models.chunk import Chunk
 from app.models.document import Document, DocumentStatus
 from app.services import chunking_service, cleaning_service, contract_gate_service
-from app.services import embedding_service, vector_store_service
+from app.services import embedding_service, retrieval_service, vector_store_service
 from app.services.extraction_service import ExtractionError, extract_text
 from app.utils.file_validation import validate_upload
 
@@ -152,5 +152,4 @@ def search_document(db: Session, document_id: int, query_text: str, *, top_k: in
             f"Document {document_id} is not embedded yet (current status: '{document.status}')."
         )
 
-    query_embedding = embedding_service.embed_texts([query_text])[0]
-    return vector_store_service.query(document_id, query_embedding, top_k)
+    return retrieval_service.retrieve(document_id, query_text, top_k=top_k)

@@ -198,13 +198,49 @@ irrelevant chunks, proving real semantic (not keyword) search. Also
 verified re-embedding is idempotent: chunk count and Chroma vector count
 both stayed at 10 after embedding twice — no duplicates.
 
-**Next up — Sprint 5 (Retrieval + RAG Q&A):** `POST /documents/{id}/ask`
-— retrieve top-k chunks via `vector_store_service.query` (already built),
-build a grounded prompt, call the LLM through `get_llm_provider()` (real
-Groq implementation replaces `StubLLMProvider` here), parse structured
-JSON `{answer, citations}`, verify each citation's quote actually appears
-in its cited chunk, persist to new `ChatSession`/`ChatMessage` tables.
-Needs `app/services/retrieval_service.py`, `qa_service.py`,
-`app/prompts/qa_prompt.py`, `app/models/chat.py`, `app/schemas/qa.py`,
-and `groq` uncommented in `requirements.txt` + a real `GroqLLMProvider`
-added to `llm_service.py`.
+**Sprint 5 — COMPLETE.** `POST /documents/{id}/ask` retrieves top-k chunks
+(`app/services/retrieval_service.py`, shared with `/search`), builds a
+grounded prompt (`app/prompts/qa_prompt.py`) instructing the LLM to answer
+only from the excerpts and cite verbatim quotes, calls the real
+`GroqLLMProvider` (`llm_service.py`, JSON mode via
+`response_format={"type": "json_object"}`), parses the structured
+`{answer, citations}` response, and drops any citation whose quote can't
+be found verbatim in its cited chunk before persisting. `GET
+/documents/{id}/chat` returns full history. Chat is modeled as
+`ChatSession`/`ChatMessage` (`app/models/chat.py`,
+`app/db/chat_repository.py`), with `session_id` as an external UUID (same
+pattern as `Document.uuid`) — omit it on `/ask` to start a new session, or
+pass a prior one to continue a conversation. If the closest retrieved
+chunk's distance exceeds `MAX_DISTANCE_FOR_ANSWER` (1.5, tuned empirically
+against MiniLM output), the endpoint returns "not relevant" without
+calling the LLM at all — cost savings and a hallucination guard in one.
+`LLMProvider` factory (`get_llm_provider()`) now supports `groq` in
+addition to `stub`; the contract gate's ambiguous-case LLM confirmation
+(Sprint 3) automatically starts using real Groq calls too now that
+`LLM_PROVIDER=groq` is set, with no code changes needed there.
+
+Verified live end-to-end with a real Groq API key: asked "How can this
+agreement be terminated?" — got a correct, grounded answer citing chunk 3
+(Term and Termination) with a verbatim-verified quote; asked a follow-up
+in the same session ("What law governs this agreement?") — correctly
+retrieved chunk 4 (Governing Law); asked an out-of-scope question ("tax
+withholding rate for employee bonuses") — correctly short-circuited to
+the "not relevant" response without an LLM call; verified an invalid
+`session_id` returns a clean 409, not a crash. Also confirmed (with a
+still-stub-provider test before the key was wired up) that a missing LLM
+integration fails cleanly through the generic exception handler — no raw
+stack trace ever reaches the client, matching guardrail #5.
+
+**Next up — Sprint 6 (Clause Detection & Structured Analysis):** `POST
+/documents/{id}/analyze-clauses` scans the ~20-clause taxonomy, doing a
+targeted retrieval + LLM call per clause type (skipping types with no
+close-enough match), returning `{clause_type, found,
+plain_language_explanation, risk_level, why_it_matters, citation,
+recommendation}` per type — reusing the retrieve → prompt → LLM →
+verify-citation pattern established in Sprint 5. Needs `app/core/
+clause_taxonomy.py` (fixed Enum of clause types + risk levels),
+`app/services/clause_service.py`, `app/prompts/
+clause_detection_prompt.py`, `app/models/analysis.py` (`ClauseAnalysis`),
+`app/schemas/clause.py`, plus `GET /documents/{id}/clauses`. Re-running
+must replace prior results per document_id+clause_type (same
+idempotency pattern as chunk/vector replacement).
