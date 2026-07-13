@@ -16,7 +16,11 @@ def _error_response(status_code: int, error_code: str, message: str) -> JSONResp
 def register_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(AppException)
     async def handle_app_exception(request: Request, exc: AppException) -> JSONResponse:
-        return _error_response(exc.status_code, exc.error_code, exc.message)
+        response = _error_response(exc.status_code, exc.error_code, exc.message)
+        retry_after = getattr(exc, "retry_after_seconds", None)
+        if retry_after is not None:
+            response.headers["Retry-After"] = str(retry_after)
+        return response
 
     @app.exception_handler(RequestValidationError)
     async def handle_validation_exception(request: Request, exc: RequestValidationError) -> JSONResponse:

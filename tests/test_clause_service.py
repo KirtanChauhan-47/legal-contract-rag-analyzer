@@ -4,9 +4,11 @@ present/absent decisions, idempotent re-analysis, per-document scoping,
 and reuse of the existing hybrid retrieval_service."""
 import json
 
+import pytest
 from conftest import make_document
 
 from app.core.clause_taxonomy import ClauseType
+from app.core.exceptions import RateLimitedError
 from app.db.analysis_repository import ClauseAnalysisRepository
 from app.services import clause_service, retrieval_service
 
@@ -222,3 +224,58 @@ def test_clause_detection_reuses_hybrid_retrieval_service(db_session, monkeypatc
 
     assert calls, "expected clause_service to call retrieval_service.retrieve at least once"
     assert all(call[0] == 42 for call in calls)
+
+
+# --- 7. A provider rate-limit failure mid-run does not corrupt results --
+
+
+class _RateLimitedAfterNCallsProvider:
+    """Simulates hitting Groq's rate limit partway through a 20-clause run."""
+
+    def __init__(self, fail_after: int):
+        self._fail_after = fail_after
+        self.calls = 0
+
+    def generate(self, prompt, *, system=None):
+        self.calls += 1
+        if self.calls > self._fail_after:
+            raise RateLimitedError("Groq rate limit reached (simulated)", retry_after_seconds=30)
+        return json.dumps(
+            {"present": False, "summary": None, "risk_level": "unknown", "risk_explanation": None, "citations": []}
+        )
+
+
+def test_rate_limit_during_analysis_does_not_corrupt_existing_results(db_session, monkeypatch):
+    document = make_document(db_session, filename="doc.txt")
+
+    # Seed prior results as if a previous successful run already completed.
+    prior_results = [
+        {
+            "clause_type": clause_type.value,
+            "present": False,
+            "summary": None,
+            "risk_level": "unknown",
+            "risk_explanation": None,
+            "citations": [],
+        }
+        for clause_type in ClauseType
+    ]
+    repo = ClauseAnalysisRepository(db_session)
+    repo.replace_for_document(document.id, prior_results)
+    db_session.commit()
+
+    # A single shared provider instance -- its call counter must persist
+    # across every clause type in the run, not reset per call.
+    flaky_provider = _RateLimitedAfterNCallsProvider(fail_after=3)
+    monkeypatch.setattr(retrieval_service, "retrieve", lambda db, doc_id, q, top_k: [_relevant_chunk()])
+    monkeypatch.setattr(clause_service, "get_llm_provider", lambda: flaky_provider)
+
+    with pytest.raises(RateLimitedError):
+        clause_service.analyze_clauses(db_session, document.id)
+
+    # The whole result list is built in memory before replace_for_document
+    # is ever called -- a mid-run failure must leave prior rows untouched,
+    # not partially overwritten or duplicated.
+    rows_after_failure = repo.list_by_document(document.id)
+    assert len(rows_after_failure) == len(ClauseType)
+    assert {row.clause_type for row in rows_after_failure} == {ct.value for ct in ClauseType}

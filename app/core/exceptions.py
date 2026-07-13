@@ -35,3 +35,18 @@ class ConflictError(AppException):
 
     status_code = 409
     error_code = "conflict"
+
+
+class RateLimitedError(AppException):
+    """Raised when the configured LLM provider's own rate/quota limit is
+    hit. Distinct from ConflictError (which is about our status-machine
+    ordering) -- this is an upstream provider constraint, surfaced as a
+    clean 429 rather than a generic 500, without leaking provider-internal
+    details (org IDs, raw error bodies) to the client."""
+
+    status_code = 429
+    error_code = "rate_limited"
+
+    def __init__(self, message: str, *, retry_after_seconds: int | None = None):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
