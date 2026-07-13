@@ -4,7 +4,7 @@ module."""
 from sqlalchemy.orm import Session
 
 from app.db.repository import Repository
-from app.models.analysis import ClauseAnalysis
+from app.models.analysis import ClauseAnalysis, ClauseAnalysisRun
 
 
 class ClauseAnalysisRepository(Repository[ClauseAnalysis]):
@@ -27,3 +27,22 @@ class ClauseAnalysisRepository(Repository[ClauseAnalysis]):
         self.db.query(ClauseAnalysis).filter(ClauseAnalysis.document_id == document_id).delete()
         for analysis in analyses:
             self.db.add(ClauseAnalysis(document_id=document_id, **analysis))
+
+
+class ClauseAnalysisRunRepository(Repository[ClauseAnalysisRun]):
+    def __init__(self, db: Session):
+        super().__init__(db, ClauseAnalysisRun)
+
+    def get_for_document(self, document_id: int) -> ClauseAnalysisRun | None:
+        return self.db.get(ClauseAnalysisRun, document_id)
+
+    def upsert(self, document_id: int, fingerprint: str, *, model: str) -> None:
+        """Records (or updates) the fingerprint of the inputs used for a
+        document's most recent successful clause analysis run. Does not
+        commit -- caller controls the transaction."""
+        existing = self.get_for_document(document_id)
+        if existing is None:
+            self.db.add(ClauseAnalysisRun(document_id=document_id, fingerprint=fingerprint, model=model))
+        else:
+            existing.fingerprint = fingerprint
+            existing.model = model

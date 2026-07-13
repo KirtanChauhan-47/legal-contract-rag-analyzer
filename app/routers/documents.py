@@ -71,8 +71,12 @@ def search_document(
 
 
 @router.post("/{document_id}/analyze-clauses", response_model=list[ClauseAnalysisRead])
-def analyze_clauses(document_id: int, db: Session = Depends(get_db)):
-    return clause_service.analyze_clauses(db, document_id)
+def analyze_clauses(
+    document_id: int,
+    force: bool = Query(False, description="Re-run and call the LLM even if cached results are still valid."),
+    db: Session = Depends(get_db),
+):
+    return clause_service.analyze_clauses(db, document_id, force=force)
 
 
 @router.get("/{document_id}/clauses", response_model=list[ClauseAnalysisRead])

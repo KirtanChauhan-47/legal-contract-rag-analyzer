@@ -451,10 +451,85 @@ second run.
   tier used during development); heavy same-day testing (multiple full
   20-clause analysis runs plus `/ask` calls) can hit `429
   rate_limit_exceeded`. The Groq SDK auto-retries transient 429s
-  internally, but a hard daily-quota 429 propagates as a clean 500 (no
-  raw stack trace to the client, per guardrail #5) rather than succeeding.
+  internally, but a hard daily-quota 429 now propagates as a clean 429
+  `rate_limited` response (see Sprint 6.1 below) rather than a generic 500.
   Not a code bug — an external operational constraint worth knowing about
   when testing multiple sprints' worth of LLM calls in one day.
+
+## Sprint 6.1 — clause-analysis cost measurement + optimization
+
+A measurement-first reliability/efficiency pass, prompted by hitting the
+Groq daily quota mid-Sprint-6-testing (`429 rate_limit_exceeded`, one
+clause call alone requesting ~2,883 tokens).
+
+**Measured (real, against `resources/agreement_doc1.pdf`, document_id 2):**
+20/20 clause types reached the LLM every run (~50,000–52,000 total tokens
+per full analysis — cross-checked against 3 real Groq calls with
+`response.usage`, not just an approximation). Root-caused *why* all 20
+passed the relevance gate: (a) short 2-token aliases like `"non-compete"`
+can hit the 0.5 keyword-overlap threshold via one common-word partial
+match (confirmed: `non_compete`/`non_solicitation` passed on kw=0.50 alone
+and were correctly absent — 2 plausibly-avoidable calls); (b) ubiquitous
+contract vocabulary saturates keyword scoring even at kw=1.00
+(`obligations` — needs rarer-token/TF-IDF weighting, not a bigger
+threshold, to fix); (c) **exact-phrase matching is not a safe shortcut
+either** — `force_majeure` hit `exact_phrase_match=True` (the term is
+mentioned as a termination trigger) yet the clause is genuinely absent, so
+an "exact phrase ⇒ skip the LLM and assume present" heuristic would have
+been wrong; (d) `dispute_resolution` sits on a near-identical signal
+profile to the two avoidable calls (kw=0.50, moderate vector distance) but
+is a **true positive** — proof that a single document's data is not
+enough to safely calibrate a new hard relevance threshold without risking
+recall loss. Full table and reasoning kept in conversation history; the
+conclusion — do not tighten the shared relevance gate on one document's
+evidence — is what's binding here.
+
+**Implemented (this pass):**
+1. **Groq rate limits mapped to a clean 429.** `GroqLLMProvider.generate()`
+   catches `groq.RateLimitError` and raises a new `RateLimitedError` (`app/
+   core/exceptions.py`, status 429, error_code `rate_limited`), preserving
+   a real `Retry-After` header when Groq's response includes one via
+   `error_handlers.py`'s `AppException` handler — never the raw provider
+   message text, which can contain org/account identifiers.
+2. **`MAX_CHUNKS_FOR_PROMPT` lowered from 6 to 3**, plus near-duplicate
+   suppression (`clause_service._select_prompt_chunks`/`_is_near_duplicate`,
+   token-Jaccard overlap ≥0.85 against already-selected chunks) — found and
+   fixed a real case of waste: `governing_law` was citing the same
+   sentence from two chunks (60 and 61) that contain near-identical text.
+   Verified safe by comparing, per clause type, the chunk_ids actually
+   cited in the prior full (MAX=6) run against what the new selection
+   would include: 15/16 previously-cited clause types keep 100% of their
+   citation evidence unchanged; the one exception (`jurisdiction`) lost
+   access to chunk 60 specifically *because* it's the near-duplicate of
+   chunk 61 (which is retained) — i.e. the loss is the dedup mechanism
+   working as intended, not a grounding regression.
+3. **Analysis result caching.** `POST /documents/{id}/analyze-clauses?
+   force=false` (default) now skips calling the LLM entirely if a
+   `ClauseAnalysisRun` row (new table, `app/models/analysis.py`) shows the
+   current fingerprint already matches the last successful run.
+   `clause_service._compute_analysis_fingerprint()` hashes chunk text
+   (captures document + re-chunking changes), the clause taxonomy/alias
+   dict, the full `SYSTEM_PROMPT` text, and the configured Groq/embedding
+   model names — deliberately hashing actual content rather than
+   maintaining manually-bumped version constants, so nothing can be
+   forgotten. `force=true` bypasses the cache unconditionally.
+
+**Verified:** all 25 automated tests pass (7 new: rate-limit mid-run
+leaves prior rows untouched, cache-hit skips the LLM, `force=true`
+bypasses the cache, changed chunk content invalidates the cache,
+near-duplicate suppression). Live-verified the cache-hit path against the
+real DB (seeded a matching fingerprint, confirmed zero LLM calls; then
+confirmed `force=true` does attempt one) since the Groq daily quota was
+still exhausted at verification time — a real 429 was also observed live
+during this pass and confirmed to surface as the new clean `rate_limited`
+error, not a crash.
+
+**Deliberately not done in this pass** (per the written plan, needs more
+than one document to validate safely): tightening `retrieval_service.
+is_relevant()`'s thresholds or adding rarer-token weighting. Also not
+done: smaller-model config split, batching multiple clause types per
+call, resume-partial-analysis — all flagged as Tier 2/3 in the plan,
+higher complexity/risk, not pursued without further evidence.
 
 **Next up — Sprint 7 (Contract-Level Summary & Risk Aggregation):** `POST
 /documents/{id}/summarize` — contract type classification, parties/dates/

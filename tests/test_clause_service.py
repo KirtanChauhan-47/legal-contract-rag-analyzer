@@ -171,7 +171,9 @@ def test_rerunning_analysis_does_not_duplicate_results(db_session, monkeypatch):
     clause_service.analyze_clauses(db_session, document.id)
     first_count = len(ClauseAnalysisRepository(db_session).list_by_document(document.id))
 
-    clause_service.analyze_clauses(db_session, document.id)
+    # force=True bypasses the Sprint 6.1 result cache so this genuinely
+    # re-runs replace_for_document a second time, proving no duplicates.
+    clause_service.analyze_clauses(db_session, document.id, force=True)
     second_count = len(ClauseAnalysisRepository(db_session).list_by_document(document.id))
 
     assert first_count == len(ClauseType)
@@ -279,3 +281,121 @@ def test_rate_limit_during_analysis_does_not_corrupt_existing_results(db_session
     rows_after_failure = repo.list_by_document(document.id)
     assert len(rows_after_failure) == len(ClauseType)
     assert {row.clause_type for row in rows_after_failure} == {ct.value for ct in ClauseType}
+
+
+# --- 8. Sprint 6.1: analysis caching (fingerprint-based skip) -----------
+
+
+class _CountingProvider:
+    def __init__(self, response_text: str):
+        self._response_text = response_text
+        self.call_count = 0
+
+    def generate(self, prompt, *, system=None):
+        self.call_count += 1
+        return self._response_text
+
+
+def _seed_one_real_chunk(db_session, document_id: int, text: str) -> None:
+    from app.db.chunk_repository import ChunkRepository
+
+    ChunkRepository(db_session).replace_for_document(
+        document_id,
+        [{"chunk_index": 0, "text": text, "char_start": 0, "char_end": len(text), "section_label": None, "token_count": len(text.split())}],
+    )
+    db_session.commit()
+
+
+def test_unchanged_rerun_skips_llm_calls_by_default(db_session, monkeypatch):
+    document = make_document(db_session, filename="doc.txt")
+    _seed_one_real_chunk(db_session, document.id, "Governing law is Delaware.")
+
+    chunk = _relevant_chunk(text="Governing law is Delaware.")
+    provider = _CountingProvider(
+        json.dumps(
+            {
+                "present": True,
+                "summary": "Delaware law governs.",
+                "risk_level": "low",
+                "risk_explanation": None,
+                "citations": [{"chunk_id": 1, "quote": "Governing law is Delaware."}],
+            }
+        )
+    )
+    monkeypatch.setattr(retrieval_service, "retrieve", lambda db, doc_id, q, top_k: [chunk])
+    monkeypatch.setattr(clause_service, "get_llm_provider", lambda: provider)
+
+    clause_service.analyze_clauses(db_session, document.id)
+    calls_after_first_run = provider.call_count
+    assert calls_after_first_run > 0
+
+    clause_service.analyze_clauses(db_session, document.id)  # force=False (default), nothing changed
+    assert provider.call_count == calls_after_first_run, "expected zero additional LLM calls on an unchanged rerun"
+
+
+def test_force_true_bypasses_the_cache(db_session, monkeypatch):
+    document = make_document(db_session, filename="doc.txt")
+    _seed_one_real_chunk(db_session, document.id, "Governing law is Delaware.")
+
+    chunk = _relevant_chunk(text="Governing law is Delaware.")
+    provider = _CountingProvider(
+        json.dumps(
+            {
+                "present": True,
+                "summary": "Delaware law governs.",
+                "risk_level": "low",
+                "risk_explanation": None,
+                "citations": [{"chunk_id": 1, "quote": "Governing law is Delaware."}],
+            }
+        )
+    )
+    monkeypatch.setattr(retrieval_service, "retrieve", lambda db, doc_id, q, top_k: [chunk])
+    monkeypatch.setattr(clause_service, "get_llm_provider", lambda: provider)
+
+    clause_service.analyze_clauses(db_session, document.id)
+    calls_after_first_run = provider.call_count
+
+    clause_service.analyze_clauses(db_session, document.id, force=True)
+    assert provider.call_count > calls_after_first_run, "expected force=True to re-call the LLM despite an unchanged fingerprint"
+
+
+def test_changed_chunks_invalidate_the_cache(db_session, monkeypatch):
+    document = make_document(db_session, filename="doc.txt")
+    _seed_one_real_chunk(db_session, document.id, "Governing law is Delaware.")
+
+    provider = _CountingProvider(
+        json.dumps(
+            {"present": True, "summary": "s", "risk_level": "low", "risk_explanation": None, "citations": [{"chunk_id": 1, "quote": "x"}]}
+        )
+    )
+    monkeypatch.setattr(retrieval_service, "retrieve", lambda db, doc_id, q, top_k: [_relevant_chunk(text="x")])
+    monkeypatch.setattr(clause_service, "get_llm_provider", lambda: provider)
+
+    clause_service.analyze_clauses(db_session, document.id)
+    calls_after_first_run = provider.call_count
+
+    # Re-process the document with different chunk text -- the fingerprint
+    # must change, so the next analysis must NOT be served from cache.
+    _seed_one_real_chunk(db_session, document.id, "Completely different clause text now.")
+
+    clause_service.analyze_clauses(db_session, document.id)  # still force=False
+    assert provider.call_count > calls_after_first_run, "expected changed chunk content to invalidate the cache"
+
+
+# --- 9. Sprint 6.1: near-duplicate chunk suppression --------------------
+
+
+def test_near_duplicate_candidate_chunks_are_not_both_sent_to_the_prompt():
+    identical_text = "This Agreement will for all purposes be governed by the laws of the State of California."
+    candidates = [
+        {**_relevant_chunk(chunk_id=60, text=identical_text), "combined_score": 6.0},
+        {**_relevant_chunk(chunk_id=61, text=identical_text), "combined_score": 5.9},
+        {**_relevant_chunk(chunk_id=99, text="A totally different clause about indemnification obligations."), "combined_score": 5.5},
+    ]
+
+    selected = clause_service._select_prompt_chunks(candidates, max_chunks=3)
+
+    selected_ids = [c["chunk_id"] for c in selected]
+    assert 60 in selected_ids
+    assert 61 not in selected_ids, "near-duplicate of chunk 60 should have been skipped"
+    assert 99 in selected_ids

@@ -9,18 +9,25 @@ being 20 unconditional LLM calls per document.
 Reuses the same retrieve -> prompt -> LLM -> parse -> verify-citations
 pattern qa_service established in Sprint 5, via the shared
 citation_verification helpers.
+
+Sprint 6.1 cost-reduction pass (see CLAUDE.md): fewer, deduplicated chunks
+per prompt, plus a content-fingerprint cache so re-running analysis on an
+unchanged document skips the LLM entirely.
 """
+import hashlib
 import logging
 
 from sqlalchemy.orm import Session
 
 from app.core.clause_taxonomy import CLAUSE_INFO, CLAUSE_SEARCH_QUERIES, VALID_RISK_LEVELS, ClauseType, RiskLevel
+from app.core.config import get_settings
 from app.core.exceptions import ConflictError
-from app.db.analysis_repository import ClauseAnalysisRepository
+from app.db.analysis_repository import ClauseAnalysisRepository, ClauseAnalysisRunRepository
+from app.db.chunk_repository import ChunkRepository
 from app.models.analysis import ClauseAnalysis
 from app.models.document import DocumentStatus
 from app.prompts.clause_detection_prompt import SYSTEM_PROMPT, build_clause_prompt
-from app.services import document_service, retrieval_service
+from app.services import document_service, embedding_service, retrieval_service
 from app.services.citation_verification import parse_llm_json, verify_citations
 from app.services.llm_service import get_llm_provider
 
@@ -30,13 +37,28 @@ logger = logging.getLogger(__name__)
 # a clause type's aliases.
 CHUNKS_PER_ALIAS = 3
 # Cap on how many merged candidate chunks go into a single clause's prompt.
-MAX_CHUNKS_FOR_PROMPT = 6
+# Lowered from 6 to 3 (Sprint 6.1): measurement against a real document
+# showed most present clauses only ever cited 1-2 chunks, so the extra
+# chunks were mostly pure token cost, not accuracy -- verified unchanged
+# present/absent results after this change (see CLAUDE.md).
+MAX_CHUNKS_FOR_PROMPT = 3
+# A candidate whose text overlaps an already-selected chunk's text at or
+# above this token-Jaccard-style ratio is treated as a near-duplicate and
+# skipped -- real contracts sometimes repeat the same boilerplate
+# paragraph in two sections (observed live: a "Governing Law" sentence
+# cited from two separate chunks that were nearly identical text).
+NEAR_DUPLICATE_OVERLAP_THRESHOLD = 0.85
 
 
-def analyze_clauses(db: Session, document_id: int) -> list[ClauseAnalysis]:
+def analyze_clauses(db: Session, document_id: int, *, force: bool = False) -> list[ClauseAnalysis]:
     """Runs detection for every clause type in the taxonomy and persists
     the results. Safe to call again on an already-analyzed document --
-    prior results are replaced, not accumulated."""
+    prior results are replaced, not accumulated.
+
+    Unless force=True, a repeated call is skipped entirely (no LLM calls)
+    if a fingerprint of the document's chunk text, clause taxonomy/prompt,
+    and configured models exactly matches the last successful run.
+    """
     document = document_service.get_document(db, document_id)
     if document.status not in (DocumentStatus.EMBEDDED.value, DocumentStatus.ANALYZED.value):
         raise ConflictError(
@@ -44,14 +66,52 @@ def analyze_clauses(db: Session, document_id: int) -> list[ClauseAnalysis]:
             f"(current status: '{document.status}')."
         )
 
+    repo = ClauseAnalysisRepository(db)
+    run_repo = ClauseAnalysisRunRepository(db)
+    current_fingerprint = _compute_analysis_fingerprint(db, document_id)
+
+    if not force:
+        existing_run = run_repo.get_for_document(document_id)
+        existing_results = repo.list_by_document(document_id)
+        if existing_run is not None and existing_run.fingerprint == current_fingerprint and existing_results:
+            logger.info(
+                "Clause analysis for document %s is up to date (fingerprint match); skipping LLM calls.",
+                document_id,
+            )
+            return existing_results
+
     analyses = [_analyze_one_clause(db, document_id, clause_type) for clause_type in ClauseType]
 
-    repo = ClauseAnalysisRepository(db)
     repo.replace_for_document(document_id, analyses)
+    run_repo.upsert(document_id, current_fingerprint, model=get_settings().groq_model)
     document.status = DocumentStatus.ANALYZED.value
     db.commit()
 
     return repo.list_by_document(document_id)
+
+
+def _compute_analysis_fingerprint(db: Session, document_id: int) -> str:
+    """Hashes everything a clause-analysis result depends on: the actual
+    chunk text (captures both document content and chunking/re-chunking
+    changes), the clause taxonomy + search aliases, the prompt text, and
+    the configured LLM/embedding models. Any change to any of these
+    changes the fingerprint and invalidates the cache -- no manually
+    maintained version numbers to forget to bump."""
+    chunks = ChunkRepository(db).list_by_document(document_id)
+    chunk_text_blob = "\x00".join(chunk.text for chunk in chunks)
+    taxonomy_blob = repr(sorted(CLAUSE_SEARCH_QUERIES.items()))
+    settings = get_settings()
+
+    components = "\x00".join(
+        [
+            chunk_text_blob,
+            taxonomy_blob,
+            SYSTEM_PROMPT,
+            settings.groq_model,
+            embedding_service.MODEL_NAME,
+        ]
+    )
+    return hashlib.sha256(components.encode("utf-8")).hexdigest()
 
 
 def get_clauses(db: Session, document_id: int) -> list[ClauseAnalysis]:
@@ -78,13 +138,35 @@ def _analyze_one_clause(db: Session, document_id: int, clause_type: ClauseType) 
     if not candidates or not retrieval_service.is_relevant(candidates[0]):
         return _absent_result(clause_type)
 
-    prompt_chunks = candidates[:MAX_CHUNKS_FOR_PROMPT]
+    prompt_chunks = _select_prompt_chunks(candidates, MAX_CHUNKS_FOR_PROMPT)
     prompt = build_clause_prompt(info["label"], info["description"], prompt_chunks)
 
     provider = get_llm_provider()
     raw_response = provider.generate(prompt, system=SYSTEM_PROMPT)
 
     return _parse_clause_response(raw_response, prompt_chunks, clause_type)
+
+
+def _select_prompt_chunks(candidates: list[dict], max_chunks: int) -> list[dict]:
+    """Picks up to max_chunks candidates, in ranked order, skipping any
+    candidate whose text is a near-duplicate of one already selected."""
+    selected: list[dict] = []
+    for candidate in candidates:
+        if len(selected) >= max_chunks:
+            break
+        if any(_is_near_duplicate(candidate["text"], chosen["text"]) for chosen in selected):
+            continue
+        selected.append(candidate)
+    return selected
+
+
+def _is_near_duplicate(text_a: str, text_b: str, *, threshold: float = NEAR_DUPLICATE_OVERLAP_THRESHOLD) -> bool:
+    tokens_a = set(text_a.lower().split())
+    tokens_b = set(text_b.lower().split())
+    if not tokens_a or not tokens_b:
+        return False
+    overlap = len(tokens_a & tokens_b) / min(len(tokens_a), len(tokens_b))
+    return overlap >= threshold
 
 
 def _absent_result(clause_type: ClauseType) -> dict:

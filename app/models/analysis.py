@@ -28,3 +28,21 @@ class ClauseAnalysis(Base):
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ClauseAnalysisRun(Base):
+    """Tracks the fingerprint of the inputs (chunk text, taxonomy, prompt,
+    model config) behind a document's most recent successful clause
+    analysis, so a repeated POST /analyze-clauses can skip re-calling the
+    LLM entirely when nothing relevant has changed. One row per document
+    (document_id is the primary key) -- no history needed, just current
+    state."""
+
+    __tablename__ = "clause_analysis_runs"
+
+    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id"), primary_key=True)
+    fingerprint: Mapped[str] = mapped_column(String(64))
+    model: Mapped[str] = mapped_column(String(100))
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
