@@ -17,6 +17,5 @@ chromadb
 # --- Sprint 5+: LLM generation ---
 groq
 
-# --- Sprint 8: testing ---
-# pytest
-# httpx
+# --- Sprint 5.1 hardening: testing (full test-client suite lands Sprint 8) ---
+pytest

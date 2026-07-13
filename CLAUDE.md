@@ -321,6 +321,55 @@ quirk, not a retrieval or chunking bug) — citations still verify correctly
 since the artifact is consistent between stored and quoted text, but it's
 a text-quality issue worth revisiting if it shows up in more documents.
 
+## Sprint 5.1 hardening pass (between the retrieval fix and Sprint 6)
+
+A focused bugfix/hardening pass, not a new sprint of features:
+
+1. **Chat-session document scoping bug fixed.** `ChatSessionRepository`
+   previously exposed `get_by_uuid(session_uuid)`, which looked up a
+   session by UUID with no document filter — a session UUID created for
+   document A could be reused via document B's `/ask` and would silently
+   succeed. Replaced with `get_by_uuid_for_document(session_uuid,
+   document_id)`, which requires both to match; `qa_service.ask()` now
+   raises a 409 `ConflictError` if the session doesn't belong to the
+   requested document. Verified both by a unit test and live via the API
+   (a real session from one embedded document was rejected against a
+   second embedded document).
+2. **Automated pytest suite added** (`tests/`, run via `python -m pytest
+   tests/ -v`) — 11 tests covering: exact-phrase retrieval ranking (the
+   Sprint 5 fix), cross-document session rejection, invalid citation
+   quotes being dropped, an LLM answer being withheld when all its
+   citations fail verification, unparseable/malformed LLM JSON being
+   withheld rather than passed through, Markdown-fenced JSON being
+   parsed, and chunk-replacement idempotency (both single- and
+   multi-document). Tests use an in-memory SQLite DB and monkeypatch the
+   embedding model / Chroma / LLM provider — no network access or Groq
+   key needed to run them.
+3. **Groq JSON parsing hardened** (`qa_service._parse_llm_json`): strips
+   a `\`\`\`json ... \`\`\`` Markdown fence if present before parsing,
+   validates the parsed shape (`dict` with `answer: str` and `citations:
+   list`) before trusting it, and returns `None` — never a
+   partially-trusted value — on any failure.
+4. **Ungrounded answers are now withheld, not passed through.** Previously,
+   if the LLM's citations all failed verification, the citations list came
+   back empty but the model's raw answer text was still returned as if it
+   were reliable. Now, whenever `verified_citations` is empty after
+   parsing (whether due to failed verification, unparseable JSON, or
+   invalid shape), `qa_service.UNGROUNDED_ANSWER` is returned instead of
+   the model's text — an unsupported claim about a legal document is
+   never handed back as if it were grounded, no matter how confident it
+   sounds.
+5. **README.md rewritten** — previously still said "Sprint 1 complete";
+   now documents the real pipeline, all endpoints, setup (including the
+   Groq key), the hybrid retrieval design, citation/grounding safety
+   behavior, a sample curl workflow, how to run tests, and current
+   limitations.
+
+No API response shapes changed as a result of this pass (the `/ask`
+response shape is unchanged; only its content differs when citations fail)
+and no architecture was rewritten — this was inspection + targeted fixes
+against the existing implementation.
+
 **Next up — Sprint 6 (Clause Detection & Structured Analysis):** `POST
 /documents/{id}/analyze-clauses` scans the ~20-clause taxonomy, doing a
 targeted retrieval + LLM call per clause type (skipping types with no

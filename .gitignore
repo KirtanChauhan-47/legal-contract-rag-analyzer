@@ -6,3 +6,4 @@ venv/
 legal_rag.db
 data/uploads/
 data/chroma/
+.pytest_cache/
