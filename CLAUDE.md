@@ -131,6 +131,26 @@ stays a pure parse-call-return layer.
   destructive schema change is ever needed, flag it explicitly rather than
   quietly dropping/recreating `legal_rag.db`.
 
+## Local verification conventions
+
+- `resources/` holds persistent sample documents (NDA, non-contract, etc.)
+  for manual/live testing — committed to git, never deleted or regenerated
+  between sessions. Add more sample contracts there directly rather than
+  having them recreated ad hoc each session.
+- `.env` (with real API keys) is never deleted between test runs — it's
+  gitignored, so it was never going to be committed anyway; leave it in
+  place so keys don't need re-entering every session.
+- `legal_rag.db` and `data/` (uploads + Chroma) are treated as persistent
+  local dev state by default — not wiped before every verification pass,
+  so upload/process/embed doesn't need repeating just to test something
+  downstream. Only reset them deliberately (and say so explicitly) when a
+  genuinely clean slate is needed, e.g. testing the empty-state path or
+  after a destructive schema change.
+- Throwaway one-off scripts written purely to check something (e.g. a
+  quick offset-verification script) are still fine to delete after use —
+  the persistence rule above is about fixtures and dev state, not scratch
+  tooling.
+
 ## Current sprint status
 
 **Sprint 1 — COMPLETE.** Project skeleton, FastAPI app, config, SQLAlchemy
