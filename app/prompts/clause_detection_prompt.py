@@ -3,6 +3,13 @@ already retrieved for that clause type -- never the full document. See
 clause_service.py for the retrieval-first gating that decides whether this
 prompt is even built for a given clause type."""
 
+# Bumped whenever SYSTEM_PROMPT or build_clause_prompt's shape changes in a
+# way that could change model output -- folded into clause_service's cache
+# fingerprint as an explicit, human-reviewable marker alongside the raw
+# prompt text itself (which already invalidates the cache automatically on
+# any edit; this constant documents *that* a deliberate revision happened).
+PROMPT_VERSION = "v1"
+
 SYSTEM_PROMPT = (
     "You are a contract analysis assistant helping a user understand a legal contract. "
     "You are given excerpts from a single contract that were retrieved because they are "

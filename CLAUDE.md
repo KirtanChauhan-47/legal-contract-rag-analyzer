@@ -531,6 +531,78 @@ done: smaller-model config split, batching multiple clause types per
 call, resume-partial-analysis — all flagged as Tier 2/3 in the plan,
 higher complexity/risk, not pursued without further evidence.
 
+## Sprint 6.1.1 — clause-analysis cache integrity hardening
+
+A follow-up to Sprint 6.1's caching mechanism, closing a real integrity
+gap found on inspection: the original fingerprint hashed chunk *text*
+but not chunk *id*. Reprocessing a document (`ChunkRepository.
+replace_for_document`'s delete-then-insert) can produce byte-identical
+chunk text under brand-new auto-increment ids — the old fingerprint
+would have called that "unchanged" and served a cache hit whose stored
+citations pointed at `chunk_id`s no longer present in the `chunks` table.
+
+**Fixed (`app/services/clause_service.py`):**
+1. **Fingerprint rebuilt as canonical JSON** (`json.dumps(...,
+   sort_keys=True, separators=(",", ":"))`, not `repr()`/string
+   concatenation) and now covers: every chunk's `id`, `chunk_index`,
+   `char_start`/`char_end`, `section_label`, and `text`; the full clause
+   taxonomy (labels + descriptions + search aliases, not just aliases);
+   a new explicit `PROMPT_VERSION` marker (`app/prompts/
+   clause_detection_prompt.py`, `"v1"`) alongside the raw `SYSTEM_PROMPT`
+   text; the configured `llm_provider` name (not just the model string)
+   and embedding model; `CHUNKS_PER_ALIAS`/`MAX_CHUNKS_FOR_PROMPT`/
+   `NEAR_DUPLICATE_OVERLAP_THRESHOLD`; and all of `retrieval_service`'s
+   scoring/relevance constants (`VECTOR_CANDIDATE_POOL`,
+   `MAX_EXPECTED_DISTANCE`, `EXACT_PHRASE_BONUS`, `KEYWORD_WEIGHT`,
+   `VECTOR_WEIGHT`, `MAX_DISTANCE_FOR_RELEVANCE`,
+   `MIN_KEYWORD_SCORE_FOR_RELEVANCE`). Any tuning change to any of these
+   now correctly busts the cache instead of silently serving results
+   computed under different rules.
+2. **`_covers_full_taxonomy()`** — a cache hit now additionally requires
+   the cached result set to have exactly one row per `ClauseType` (no
+   fewer — an incomplete/partial run — and no more — a duplicate).
+3. **`_cached_citations_are_valid()`** — every citation on every
+   `present=true` cached row is re-verified against the *current* chunk
+   text for its `chunk_id` (reusing `citation_verification.
+   quote_appears_in`) before a cache hit is trusted, independent of the
+   fingerprint check — defense-in-depth against drift/corruption from any
+   source, not just normal reprocessing.
+   Any single failure of either check discards the whole cached set and
+   falls through to a full fresh run, logged clearly, rather than serving
+   a partially-trusted result.
+
+**Tests added (9 new, 34 total passing):** `_covers_full_taxonomy` unit
+tests (exact match / duplicate+missing / wrong count), incomplete-cache
+triggers a fresh run, a stale citation invalidates a cache hit despite a
+genuinely matching fingerprint (seeded independently of any normal
+reprocessing path, to test the defensive check in isolation), and — the
+core regression this pass exists for — reprocessing that produces the
+same chunk text under a *different* chunk_id correctly busts the cache.
+Also added `tests/test_http_error_handling.py`: HTTP-level (through the
+full FastAPI stack via `TestClient`, not just the service layer) tests
+confirming a Groq rate limit surfaces as a real HTTP 429 with the
+`rate_limited` error code, an optional `Retry-After` header, and never
+leaks raw provider text.
+
+**Verified live** against `agreement_doc1.pdf`: confirmed the old
+(pre-hardening) stored fingerprint no longer matches the new formula
+(expected — old cached results are correctly treated as stale under the
+stricter scheme); confirmed the 20 existing rows do cover the full
+taxonomy and their citations still validate against current chunks;
+seeded a run under the new fingerprint format and confirmed a genuine
+cache hit (zero LLM calls); confirmed changing `MAX_CHUNKS_FOR_PROMPT`
+changes the fingerprint.
+
+**Known follow-on note:** the SQLite `chunks` table uses a plain
+`INTEGER PRIMARY KEY` (no explicit `AUTOINCREMENT`), so in a
+single-document, mostly-empty table, a delete-then-insert *can* reuse a
+just-freed id (test fixtures had to route around this explicitly). In
+real multi-document production data the table is essentially never
+empty, so this isn't a practical production risk — but if `chunk_id`
+reuse ever needs to be ruled out categorically, `sqlite_autoincrement`
+on `Chunk.__table_args__` is the fix; not applied here since it wasn't
+needed for a real observed problem.
+
 **Next up — Sprint 7 (Contract-Level Summary & Risk Aggregation):** `POST
 /documents/{id}/summarize` — contract type classification, parties/dates/
 obligations extraction from a curated chunk set (preamble + chunks already

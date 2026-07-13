@@ -9,7 +9,8 @@ from conftest import make_document
 
 from app.core.clause_taxonomy import ClauseType
 from app.core.exceptions import RateLimitedError
-from app.db.analysis_repository import ClauseAnalysisRepository
+from app.db.analysis_repository import ClauseAnalysisRepository, ClauseAnalysisRunRepository
+from app.db.chunk_repository import ChunkRepository
 from app.services import clause_service, retrieval_service
 
 
@@ -399,3 +400,183 @@ def test_near_duplicate_candidate_chunks_are_not_both_sent_to_the_prompt():
     assert 60 in selected_ids
     assert 61 not in selected_ids, "near-duplicate of chunk 60 should have been skipped"
     assert 99 in selected_ids
+
+
+# --- 10. Sprint 6.1.1: cache integrity hardening ------------------------
+
+
+class _FakeRow:
+    """Minimal stand-in for a ClauseAnalysis row -- only .clause_type is
+    needed to exercise _covers_full_taxonomy as a pure function."""
+
+    def __init__(self, clause_type: str):
+        self.clause_type = clause_type
+
+
+def test_covers_full_taxonomy_accepts_exactly_one_row_per_clause_type():
+    rows = [_FakeRow(ct.value) for ct in ClauseType]
+    assert clause_service._covers_full_taxonomy(rows) is True
+
+
+def test_covers_full_taxonomy_rejects_duplicate_and_missing_clause_types():
+    # Same total count as the real taxonomy, but "termination" appears
+    # twice and "parties" is missing entirely.
+    clause_values = [ct.value for ct in ClauseType if ct != ClauseType.PARTIES]
+    clause_values.append(ClauseType.TERMINATION.value)
+    rows = [_FakeRow(value) for value in clause_values]
+
+    assert len(rows) == len(ClauseType)  # right count, wrong set
+    assert clause_service._covers_full_taxonomy(rows) is False
+
+
+def test_covers_full_taxonomy_rejects_incomplete_row_count():
+    rows = [_FakeRow(ct.value) for ct in list(ClauseType)[:18]]  # only 18 of 20
+    assert clause_service._covers_full_taxonomy(rows) is False
+
+
+def test_incomplete_cache_rows_trigger_a_fresh_run(db_session, monkeypatch):
+    document = make_document(db_session, filename="doc.txt")
+    _seed_one_real_chunk(db_session, document.id, "Some clause text.")
+
+    chunks = ChunkRepository(db_session).list_by_document(document.id)
+    fingerprint = clause_service._compute_analysis_fingerprint(chunks)
+
+    # Only 18 of 20 clause types persisted -- an incomplete/partial result
+    # set, e.g. from a run that was interrupted before this hardening pass.
+    partial_results = [
+        {
+            "clause_type": ct.value,
+            "present": False,
+            "summary": None,
+            "risk_level": "unknown",
+            "risk_explanation": None,
+            "citations": [],
+        }
+        for ct in list(ClauseType)[:18]
+    ]
+    ClauseAnalysisRepository(db_session).replace_for_document(document.id, partial_results)
+    ClauseAnalysisRunRepository(db_session).upsert(document.id, fingerprint, model="test-model")
+    db_session.commit()
+
+    provider = _CountingProvider(
+        json.dumps({"present": False, "summary": None, "risk_level": "unknown", "risk_explanation": None, "citations": []})
+    )
+    monkeypatch.setattr(retrieval_service, "retrieve", lambda db, doc_id, q, top_k: [_relevant_chunk(text="Some clause text.")])
+    monkeypatch.setattr(clause_service, "get_llm_provider", lambda: provider)
+
+    clause_service.analyze_clauses(db_session, document.id)  # force=False
+
+    assert provider.call_count > 0, "expected incomplete cached taxonomy coverage to trigger a fresh run"
+
+
+def test_stale_cached_citation_invalidates_cache_despite_fingerprint_match(db_session, monkeypatch):
+    document = make_document(db_session, filename="doc.txt")
+    _seed_one_real_chunk(db_session, document.id, "Governing law is Delaware.")
+
+    chunks = ChunkRepository(db_session).list_by_document(document.id)
+    fingerprint = clause_service._compute_analysis_fingerprint(chunks)
+
+    # A run row with a genuinely-matching fingerprint, but a clause
+    # analysis row whose citation does NOT verify against current chunk
+    # text -- simulating drift/corruption independent of any normal
+    # reprocessing path (which would itself already change the fingerprint).
+    seeded_results = []
+    for ct in ClauseType:
+        if ct == ClauseType.GOVERNING_LAW:
+            seeded_results.append(
+                {
+                    "clause_type": ct.value,
+                    "present": True,
+                    "summary": "s",
+                    "risk_level": "low",
+                    "risk_explanation": None,
+                    "citations": [{"chunk_id": chunks[0].id, "quote": "this quote was never actually in the chunk"}],
+                }
+            )
+        else:
+            seeded_results.append(
+                {
+                    "clause_type": ct.value,
+                    "present": False,
+                    "summary": None,
+                    "risk_level": "unknown",
+                    "risk_explanation": None,
+                    "citations": [],
+                }
+            )
+
+    ClauseAnalysisRepository(db_session).replace_for_document(document.id, seeded_results)
+    ClauseAnalysisRunRepository(db_session).upsert(document.id, fingerprint, model="test-model")
+    db_session.commit()
+
+    provider = _CountingProvider(
+        json.dumps({"present": False, "summary": None, "risk_level": "unknown", "risk_explanation": None, "citations": []})
+    )
+    monkeypatch.setattr(retrieval_service, "retrieve", lambda db, doc_id, q, top_k: [_relevant_chunk(text="Governing law is Delaware.")])
+    monkeypatch.setattr(clause_service, "get_llm_provider", lambda: provider)
+
+    clause_service.analyze_clauses(db_session, document.id)  # force=False
+
+    assert provider.call_count > 0, "expected the stale citation to bust the cache and trigger a real re-run"
+
+
+def _seed_chunk_with_explicit_id(db_session, document_id: int, chunk_id: int, text: str) -> None:
+    """Inserts a single chunk with a caller-chosen id, bypassing
+    auto-increment entirely. Used instead of relying on natural
+    reprocessing behavior, since SQLite's rowid allocator (no explicit
+    AUTOINCREMENT on this table) can reuse a just-deleted id once a
+    document's only chunk is removed -- an artifact of a single-document
+    test table, not of real multi-document production data. Explicitly
+    controlling the id directly and deterministically tests "same text,
+    different chunk_id" instead."""
+    from app.models.chunk import Chunk
+
+    db_session.query(Chunk).filter(Chunk.document_id == document_id).delete()
+    db_session.add(
+        Chunk(
+            id=chunk_id,
+            document_id=document_id,
+            chunk_index=0,
+            text=text,
+            char_start=0,
+            char_end=len(text),
+            section_label=None,
+            token_count=len(text.split()),
+        )
+    )
+    db_session.commit()
+
+
+def test_reprocessing_with_same_text_but_new_chunk_ids_invalidates_cache(db_session, monkeypatch):
+    document = make_document(db_session, filename="doc.txt")
+    _seed_chunk_with_explicit_id(db_session, document.id, chunk_id=101, text="Governing law is Delaware.")
+
+    provider = _CountingProvider(
+        json.dumps(
+            {
+                "present": True,
+                "summary": "s",
+                "risk_level": "low",
+                "risk_explanation": None,
+                "citations": [{"chunk_id": 101, "quote": "Governing law is Delaware."}],
+            }
+        )
+    )
+    monkeypatch.setattr(retrieval_service, "retrieve", lambda db, doc_id, q, top_k: [_relevant_chunk(chunk_id=101, text="Governing law is Delaware.")])
+    monkeypatch.setattr(clause_service, "get_llm_provider", lambda: provider)
+
+    clause_service.analyze_clauses(db_session, document.id)
+    calls_after_first = provider.call_count
+    assert calls_after_first > 0
+
+    # Re-process: same text, but a genuinely different chunk_id -- exactly
+    # what real reprocessing produces (delete-then-insert with a fresh
+    # auto-increment id). Old cached citations would point at a chunk_id no
+    # longer in the table. This must bust the cache.
+    _seed_chunk_with_explicit_id(db_session, document.id, chunk_id=202, text="Governing law is Delaware.")
+    monkeypatch.setattr(retrieval_service, "retrieve", lambda db, doc_id, q, top_k: [_relevant_chunk(chunk_id=202, text="Governing law is Delaware.")])
+
+    clause_service.analyze_clauses(db_session, document.id)  # force=False
+    assert provider.call_count > calls_after_first, (
+        "expected a new chunk_id (even with identical text) to invalidate the cache"
+    )

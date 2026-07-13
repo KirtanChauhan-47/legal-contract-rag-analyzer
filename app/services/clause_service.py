@@ -13,8 +13,18 @@ citation_verification helpers.
 Sprint 6.1 cost-reduction pass (see CLAUDE.md): fewer, deduplicated chunks
 per prompt, plus a content-fingerprint cache so re-running analysis on an
 unchanged document skips the LLM entirely.
+
+Sprint 6.1.1 cache-integrity hardening (see CLAUDE.md): the fingerprint now
+covers chunk IDs (not just text) so reprocessing that recreates chunks with
+new IDs -- even with byte-identical text -- correctly busts the cache
+instead of serving citations that point at rows no longer in the chunks
+table. A cache hit additionally requires full taxonomy coverage (exactly
+one row per ClauseType, no more, no less) and passes a defensive
+re-verification of every cached citation against the *current* chunk text
+before being trusted, on top of the fingerprint check.
 """
 import hashlib
+import json
 import logging
 
 from sqlalchemy.orm import Session
@@ -25,10 +35,11 @@ from app.core.exceptions import ConflictError
 from app.db.analysis_repository import ClauseAnalysisRepository, ClauseAnalysisRunRepository
 from app.db.chunk_repository import ChunkRepository
 from app.models.analysis import ClauseAnalysis
+from app.models.chunk import Chunk
 from app.models.document import DocumentStatus
-from app.prompts.clause_detection_prompt import SYSTEM_PROMPT, build_clause_prompt
+from app.prompts.clause_detection_prompt import PROMPT_VERSION, SYSTEM_PROMPT, build_clause_prompt
 from app.services import document_service, embedding_service, retrieval_service
-from app.services.citation_verification import parse_llm_json, verify_citations
+from app.services.citation_verification import parse_llm_json, quote_appears_in, verify_citations
 from app.services.llm_service import get_llm_provider
 
 logger = logging.getLogger(__name__)
@@ -56,8 +67,13 @@ def analyze_clauses(db: Session, document_id: int, *, force: bool = False) -> li
     prior results are replaced, not accumulated.
 
     Unless force=True, a repeated call is skipped entirely (no LLM calls)
-    if a fingerprint of the document's chunk text, clause taxonomy/prompt,
-    and configured models exactly matches the last successful run.
+    only if ALL of the following hold: (1) a fingerprint covering chunk
+    identity/content, taxonomy, prompt, and model/retrieval configuration
+    exactly matches the last successful run; (2) the cached results cover
+    every ClauseType exactly once; (3) every cached citation still verifies
+    verbatim against the *current* chunk text for its chunk_id. Any failure
+    falls through to a fresh (fully re-run) analysis rather than trusting
+    a possibly-stale or corrupted cache.
     """
     document = document_service.get_document(db, document_id)
     if document.status not in (DocumentStatus.EMBEDDED.value, DocumentStatus.ANALYZED.value):
@@ -66,19 +82,32 @@ def analyze_clauses(db: Session, document_id: int, *, force: bool = False) -> li
             f"(current status: '{document.status}')."
         )
 
+    chunks = ChunkRepository(db).list_by_document(document_id)
+    current_fingerprint = _compute_analysis_fingerprint(chunks)
+
     repo = ClauseAnalysisRepository(db)
     run_repo = ClauseAnalysisRunRepository(db)
-    current_fingerprint = _compute_analysis_fingerprint(db, document_id)
 
     if not force:
         existing_run = run_repo.get_for_document(document_id)
-        existing_results = repo.list_by_document(document_id)
-        if existing_run is not None and existing_run.fingerprint == current_fingerprint and existing_results:
-            logger.info(
-                "Clause analysis for document %s is up to date (fingerprint match); skipping LLM calls.",
+        if existing_run is not None and existing_run.fingerprint == current_fingerprint:
+            existing_results = repo.list_by_document(document_id)
+            current_chunk_text_by_id = {chunk.id: chunk.text for chunk in chunks}
+            if _covers_full_taxonomy(existing_results) and _cached_citations_are_valid(
+                existing_results, current_chunk_text_by_id
+            ):
+                logger.info(
+                    "Clause analysis for document %s is up to date and passed cache integrity "
+                    "checks; skipping LLM calls.",
+                    document_id,
+                )
+                return existing_results
+            logger.warning(
+                "Cached clause analysis for document %s matched the fingerprint but failed an "
+                "integrity check (incomplete taxonomy coverage or a citation no longer verifies "
+                "against current chunks); re-running instead of trusting it.",
                 document_id,
             )
-            return existing_results
 
     analyses = [_analyze_one_clause(db, document_id, clause_type) for clause_type in ClauseType]
 
@@ -90,28 +119,97 @@ def analyze_clauses(db: Session, document_id: int, *, force: bool = False) -> li
     return repo.list_by_document(document_id)
 
 
-def _compute_analysis_fingerprint(db: Session, document_id: int) -> str:
-    """Hashes everything a clause-analysis result depends on: the actual
-    chunk text (captures both document content and chunking/re-chunking
-    changes), the clause taxonomy + search aliases, the prompt text, and
-    the configured LLM/embedding models. Any change to any of these
-    changes the fingerprint and invalidates the cache -- no manually
-    maintained version numbers to forget to bump."""
-    chunks = ChunkRepository(db).list_by_document(document_id)
-    chunk_text_blob = "\x00".join(chunk.text for chunk in chunks)
-    taxonomy_blob = repr(sorted(CLAUSE_SEARCH_QUERIES.items()))
+def _covers_full_taxonomy(results: list[ClauseAnalysis]) -> bool:
+    """A valid cached result set has exactly one row per ClauseType -- no
+    fewer (an incomplete/partial run) and no more (a duplicate)."""
+    if len(results) != len(ClauseType):
+        return False
+    return {row.clause_type for row in results} == {clause_type.value for clause_type in ClauseType}
+
+
+def _cached_citations_are_valid(results: list[ClauseAnalysis], current_chunk_text_by_id: dict[int, str]) -> bool:
+    """Re-verifies every citation on every present=True cached row against
+    the *current* chunk table -- catches citations pointing at chunk_ids
+    that were deleted/recreated by reprocessing, or any other drift between
+    what was stored and what the chunks table now actually contains."""
+    for row in results:
+        if not row.present or not row.citations:
+            continue
+        for citation in row.citations:
+            chunk_id = citation.get("chunk_id")
+            quote = citation.get("quote", "")
+            chunk_text = current_chunk_text_by_id.get(chunk_id)
+            if chunk_text is None or not quote_appears_in(quote, chunk_text):
+                return False
+    return True
+
+
+def _compute_analysis_fingerprint(chunks: list[Chunk]) -> str:
+    """Hashes everything a clause-analysis result depends on, as canonical
+    JSON (sorted keys, no extraneous whitespace) so the digest is stable
+    regardless of dict-ordering or repr() quirks:
+
+    - each chunk's id, index, offsets, section_label, and text (id is
+      included specifically so reprocessing that recreates chunks with new
+      IDs -- even with identical text -- busts the cache, since old
+      citations would otherwise point at rows no longer in the table),
+    - the clause taxonomy's labels, descriptions, and search aliases,
+    - the prompt version marker and full prompt text,
+    - the configured LLM provider/model and embedding model,
+    - the chunk-selection limits (per-alias, per-prompt) and the
+      near-duplicate dedup threshold,
+    - the retrieval scoring/relevance configuration.
+
+    Any change to any of these changes the digest and invalidates the
+    cache -- no manually maintained version numbers to forget to bump.
+    """
+    chunk_snapshot = [
+        {
+            "id": chunk.id,
+            "chunk_index": chunk.chunk_index,
+            "char_start": chunk.char_start,
+            "char_end": chunk.char_end,
+            "section_label": chunk.section_label,
+            "text": chunk.text,
+        }
+        for chunk in chunks
+    ]
+
+    taxonomy_snapshot = {
+        clause_type.value: {
+            "label": CLAUSE_INFO[clause_type]["label"],
+            "description": CLAUSE_INFO[clause_type]["description"],
+            "aliases": CLAUSE_SEARCH_QUERIES[clause_type],
+        }
+        for clause_type in ClauseType
+    }
+
     settings = get_settings()
 
-    components = "\x00".join(
-        [
-            chunk_text_blob,
-            taxonomy_blob,
-            SYSTEM_PROMPT,
-            settings.groq_model,
-            embedding_service.MODEL_NAME,
-        ]
-    )
-    return hashlib.sha256(components.encode("utf-8")).hexdigest()
+    payload = {
+        "chunks": chunk_snapshot,
+        "taxonomy": taxonomy_snapshot,
+        "prompt_version": PROMPT_VERSION,
+        "system_prompt": SYSTEM_PROMPT,
+        "llm_provider": settings.llm_provider,
+        "llm_model": settings.groq_model,
+        "embedding_model": embedding_service.MODEL_NAME,
+        "chunks_per_alias": CHUNKS_PER_ALIAS,
+        "max_chunks_for_prompt": MAX_CHUNKS_FOR_PROMPT,
+        "near_duplicate_overlap_threshold": NEAR_DUPLICATE_OVERLAP_THRESHOLD,
+        "retrieval_config": {
+            "vector_candidate_pool": retrieval_service.VECTOR_CANDIDATE_POOL,
+            "max_expected_distance": retrieval_service.MAX_EXPECTED_DISTANCE,
+            "exact_phrase_bonus": retrieval_service.EXACT_PHRASE_BONUS,
+            "keyword_weight": retrieval_service.KEYWORD_WEIGHT,
+            "vector_weight": retrieval_service.VECTOR_WEIGHT,
+            "max_distance_for_relevance": retrieval_service.MAX_DISTANCE_FOR_RELEVANCE,
+            "min_keyword_score_for_relevance": retrieval_service.MIN_KEYWORD_SCORE_FOR_RELEVANCE,
+        },
+    }
+
+    canonical_json = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
 
 def get_clauses(db: Session, document_id: int) -> list[ClauseAnalysis]:
