@@ -152,4 +152,4 @@ def search_document(db: Session, document_id: int, query_text: str, *, top_k: in
             f"Document {document_id} is not embedded yet (current status: '{document.status}')."
         )
 
-    return retrieval_service.retrieve(document_id, query_text, top_k=top_k)
+    return retrieval_service.retrieve(db, document_id, query_text, top_k=top_k)

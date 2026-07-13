@@ -19,11 +19,14 @@ from app.services.llm_service import get_llm_provider
 logger = logging.getLogger(__name__)
 
 TOP_K = 6
-# Chroma L2 distance above which the closest retrieved chunk is treated as
-# "not actually relevant" rather than forcing an answer from it. Tuned
-# empirically against all-MiniLM-L6-v2 output (correct matches typically
-# land under ~1.0, unrelated chunks above ~1.2).
+# Chroma L2 distance above which a chunk's vector signal alone is treated as
+# "not actually relevant". Tuned empirically against all-MiniLM-L6-v2 output
+# (correct matches typically land under ~1.0, unrelated chunks above ~1.2).
 MAX_DISTANCE_FOR_ANSWER = 1.5
+# Fraction of meaningful query tokens that must appear in a chunk for its
+# keyword signal alone to count as "relevant" (used when there's no exact
+# phrase match and the vector distance alone isn't conclusive).
+MIN_KEYWORD_SCORE_FOR_ANSWER = 0.5
 
 NOT_FOUND_ANSWER = "This document does not appear to contain information relevant to that question."
 
@@ -46,9 +49,9 @@ def ask(db: Session, document_id: int, question: str, session_uuid: str | None) 
     message_repo = ChatMessageRepository(db)
     message_repo.create(session_id=session.id, role="user", content=question, citations=None)
 
-    chunks = retrieval_service.retrieve(document_id, question, top_k=TOP_K)
+    chunks = retrieval_service.retrieve(db, document_id, question, top_k=TOP_K)
 
-    if not chunks or chunks[0]["distance"] > MAX_DISTANCE_FOR_ANSWER:
+    if not chunks or not _is_relevant(chunks[0]):
         answer_text = NOT_FOUND_ANSWER
         verified_citations: list[dict] = []
     else:
@@ -60,6 +63,17 @@ def ask(db: Session, document_id: int, question: str, session_uuid: str | None) 
     message_repo.create(session_id=session.id, role="assistant", content=answer_text, citations=verified_citations)
 
     return {"session_id": session.uuid, "answer": answer_text, "citations": verified_citations}
+
+
+def _is_relevant(top_chunk: dict) -> bool:
+    """Mirrors retrieval_service's hybrid signals: a chunk counts as
+    relevant if it exactly contains the query phrase, has strong keyword
+    overlap, or is close enough by vector distance -- any one is enough."""
+    if top_chunk["exact_phrase_match"]:
+        return True
+    if top_chunk["keyword_score"] >= MIN_KEYWORD_SCORE_FOR_ANSWER:
+        return True
+    return top_chunk["vector_distance"] is not None and top_chunk["vector_distance"] <= MAX_DISTANCE_FOR_ANSWER
 
 
 def _parse_and_verify(raw_response: str, chunks: list[dict]) -> tuple[str, list[dict]]:

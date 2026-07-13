@@ -251,6 +251,76 @@ still-stub-provider test before the key was wired up) that a missing LLM
 integration fails cleanly through the generic exception handler — no raw
 stack trace ever reaches the client, matching guardrail #5.
 
+## Mid-testing fix: retrieval quality (between Sprint 5 and Sprint 6)
+
+**Bug found:** manual testing with a real licensing agreement
+(`resources/agreement_doc1.pdf`) showed pure vector search under-ranking
+or entirely missing chunks containing exact legal defined terms. Searching
+`Allowable Deductions` (a phrase that appears verbatim in the Payment/
+Royalty chunk) either returned nothing at low `top_k`, or ranked the
+correct chunk as low as #9 with unrelated chunks (Basic Provisions,
+Indemnification, warranty boilerplate) ranked above it. Root cause: Chroma
+was only returning its own top-N nearest-by-embedding-distance chunks, and
+if a chunk with a matching literal phrase didn't happen to also be
+semantically close by embedding distance, it was never in the candidate
+pool at all. Separately, `chunking_service.py`'s ALL-CAPS heading regex
+was too permissive — it matched any long ALL-CAPS line, so wrapped
+continuation lines from warranty/liability disclaimer paragraphs (e.g.
+`"THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE OR ANY LEVEL OF"`) were misread as section headings, polluting
+`section_label` values.
+
+**Fix implemented:**
+- `retrieval_service.retrieve()` is now hybrid: it still pulls a wider
+  Chroma candidate pool (top 20, up from top-k), but also scores **every**
+  chunk in the document (via `ChunkRepository.list_by_document`, the SQL
+  source of truth) for exact-phrase containment and keyword-token overlap
+  against the raw query. A chunk with a verbatim phrase match is included
+  and ranked even if Chroma's embedding distance alone wouldn't have
+  surfaced it. Score = `(5.0 if exact_phrase_match) + keyword_score +
+  vector_similarity` (vector L2 distance converted to a bounded 0..1
+  similarity). Response payload now includes `vector_distance`,
+  `keyword_score`, `exact_phrase_match`, `combined_score`, and
+  `match_reason` so ranking decisions are inspectable, not just a bare
+  distance number.
+- Both `GET /documents/{id}/search` and `POST /documents/{id}/ask` go
+  through this same hybrid `retrieve()` — no separate code path for
+  debug search vs. RAG Q&A. `qa_service`'s "is this actually relevant"
+  gate (previously a raw vector-distance threshold) now checks
+  `exact_phrase_match OR keyword_score >= 0.5 OR vector_distance <=
+  threshold` — any one signal is enough, matching the new ranking logic.
+- `chunking_service.HEADING_PATTERN`'s ALL-CAPS alternative now caps
+  matches at 6 space-separated words with no commas (real headings are
+  short: `"INDEMNIFICATION"`, `"GOVERNING LAW AND FORUM"`; wrapped
+  disclaimer continuation lines are long and comma-heavy) — this alone,
+  combined with the `$`-anchored full-line match, rejects continuation
+  lines without needing a separate validation pass.
+
+**Regression queries used** (all now rank the correct chunk #1 or #2,
+verified live against `resources/agreement_doc1.pdf`): `Allowable
+Deductions`, `what is allowable deduction`, `what deductions are allowed
+from net revenue`, `Annual Minimum Guarantee`, `Royalty Statement`,
+`Governing Law`, `Termination`, `Indemnification`, `Limitation of
+Liability`. Also verified `/ask` for "What are Allowable Deductions?" and
+"What deductions are allowed from Net Revenue?" — both produced correct,
+grounded answers citing the Payment/Royalty chunk with a verbatim-verified
+quote.
+
+**Expected behavior going forward:** any future retrieval work should
+keep going through `retrieval_service.retrieve()` rather than calling
+`vector_store_service.query()` directly — that's what keeps `/search` and
+`/ask` (and Sprint 6's clause detection) behaving consistently. Chunking
+heading detection is heuristic, not perfect — if a future document
+surfaces another aggressive-heading false positive, tighten
+`HEADING_PATTERN` further rather than adding a second ad hoc filter pass.
+
+**Known remaining limitation (unrelated to this fix, not addressed):**
+`agreement_doc1.pdf` extraction has a font-encoding artifact where
+semicolons render as `Í¾` in `raw_text`/`cleaned_text` (a PyMuPDF/PDF font
+quirk, not a retrieval or chunking bug) — citations still verify correctly
+since the artifact is consistent between stored and quoted text, but it's
+a text-quality issue worth revisiting if it shows up in more documents.
+
 **Next up — Sprint 6 (Clause Detection & Structured Analysis):** `POST
 /documents/{id}/analyze-clauses` scans the ~20-clause taxonomy, doing a
 targeted retrieval + LLM call per clause type (skipping types with no

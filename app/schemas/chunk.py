@@ -15,6 +15,11 @@ class ChunkRead(BaseModel):
 
 class ChunkSearchResult(BaseModel):
     chunk_id: int
-    text: str
+    chunk_index: int
     section_label: str | None
-    distance: float
+    text: str
+    vector_distance: float | None
+    keyword_score: float
+    exact_phrase_match: bool
+    combined_score: float
+    match_reason: str

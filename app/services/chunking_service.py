@@ -14,7 +14,12 @@ HEADING_PATTERN = re.compile(
     r"^(?:"
     r"(?:Section|Article)\s+[\dIVXLC]+[.:]?.*"
     r"|\d+(?:\.\d+)*\.\s+[A-Z].*"
-    r"|[A-Z][A-Z0-9 ,&/'\-]{4,}"
+    # ALL-CAPS heading: at most 6 words, single-space-separated, no commas —
+    # real headings ("INDEMNIFICATION", "GOVERNING LAW AND FORUM") are short;
+    # wrapped ALL-CAPS body text from disclaimers/warranty blocks is long and
+    # comma-heavy, so this alone (plus $ requiring the whole line to match)
+    # keeps continuation lines from being misread as section boundaries.
+    r"|[A-Z][A-Z0-9&/'\-]{0,30}(?:[ \t][A-Z0-9&/'\-]{1,30}){0,5}"
     r")$",
     re.MULTILINE,
 )
