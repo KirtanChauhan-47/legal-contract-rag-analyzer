@@ -3,8 +3,9 @@ from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.schemas.chunk import ChunkRead, ChunkSearchResult
+from app.schemas.clause import ClauseAnalysisRead
 from app.schemas.document import DocumentListItem, DocumentRead, DocumentUploadResponse
-from app.services import document_service
+from app.services import clause_service, document_service
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -67,3 +68,13 @@ def search_document(
     db: Session = Depends(get_db),
 ):
     return document_service.search_document(db, document_id, q, top_k=top_k)
+
+
+@router.post("/{document_id}/analyze-clauses", response_model=list[ClauseAnalysisRead])
+def analyze_clauses(document_id: int, db: Session = Depends(get_db)):
+    return clause_service.analyze_clauses(db, document_id)
+
+
+@router.get("/{document_id}/clauses", response_model=list[ClauseAnalysisRead])
+def get_clauses(document_id: int, db: Session = Depends(get_db)):
+    return clause_service.get_clauses(db, document_id)

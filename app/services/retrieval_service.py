@@ -32,6 +32,18 @@ EXACT_PHRASE_BONUS = 5.0
 KEYWORD_WEIGHT = 1.0
 VECTOR_WEIGHT = 1.0
 
+# Thresholds for is_relevant() below -- shared by qa_service (per user
+# question) and clause_service (per clause-type search) to decide whether
+# retrieved evidence is strong enough to bother calling the LLM at all.
+# Chroma L2 distance above which a chunk's vector signal alone is treated
+# as "not actually relevant". Tuned empirically against all-MiniLM-L6-v2
+# output (correct matches typically land under ~1.0, unrelated above ~1.2).
+MAX_DISTANCE_FOR_RELEVANCE = 1.5
+# Fraction of meaningful query tokens that must appear in a chunk for its
+# keyword signal alone to count as "relevant" (used when there's no exact
+# phrase match and the vector distance alone isn't conclusive).
+MIN_KEYWORD_SCORE_FOR_RELEVANCE = 0.5
+
 _STOPWORDS = {
     "the", "a", "an", "is", "are", "was", "were", "of", "to", "in", "and", "or",
     "what", "which", "that", "this", "these", "those", "for", "on", "by", "with",
@@ -93,6 +105,20 @@ def retrieve(db: Session, document_id: int, query_text: str, *, top_k: int = 5) 
 
     candidates.sort(key=lambda c: c["combined_score"], reverse=True)
     return candidates[:top_k]
+
+
+def is_relevant(top_chunk: dict) -> bool:
+    """Whether a retrieved chunk represents strong enough evidence to act
+    on (answer a question from it, or treat a clause type as present) --
+    any one signal (exact phrase, keyword overlap, or close vector
+    distance) is sufficient. Shared by qa_service and clause_service so
+    both retrieve-then-generate pipelines apply the same bar before
+    spending an LLM call."""
+    if top_chunk["exact_phrase_match"]:
+        return True
+    if top_chunk["keyword_score"] >= MIN_KEYWORD_SCORE_FOR_RELEVANCE:
+        return True
+    return top_chunk["vector_distance"] is not None and top_chunk["vector_distance"] <= MAX_DISTANCE_FOR_RELEVANCE
 
 
 def _normalize(text: str) -> str:

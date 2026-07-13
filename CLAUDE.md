@@ -93,27 +93,39 @@ check current status and fail clearly (409/422 via `ConflictError`/
 ```
 app/
 ├── main.py                 # FastAPI app factory, router mounting, startup event (init_db)
-├── core/                    # config.py, exceptions.py, error_handlers.py, logging_config.py
-│                             # (clause_taxonomy.py, auth.py land in later sprints)
-├── db/                       # base.py (engine/Base), session.py (get_db), init_db.py, repository.py
-├── models/                    # document.py, chunk.py  (analysis.py, chat.py land in later sprints)
-├── schemas/                    # document.py, chunk.py  (qa.py, clause.py, summary.py land later)
-├── routers/                     # health.py, documents.py  (qa.py, clauses.py, summary.py land later)
-├── services/                     # llm_service.py (interface + stub only), extraction_service.py,
-│                                   # document_service.py (upload + process orchestration),
-│                                   # contract_gate_service.py, cleaning_service.py, chunking_service.py
-├── prompts/                       # contract_gate_prompt.py
-└── utils/                          # file_validation.py
+├── core/                    # config.py, exceptions.py, error_handlers.py, logging_config.py,
+│                             # clause_taxonomy.py  (auth.py lands later, if ever requested)
+├── db/                       # base.py (engine/Base), session.py (get_db), init_db.py, repository.py,
+│                               # chunk_repository.py, chat_repository.py, analysis_repository.py
+├── models/                    # document.py, chunk.py, chat.py, analysis.py (ClauseAnalysis)
+├── schemas/                    # document.py, chunk.py, qa.py, clause.py  (summary.py lands Sprint 7)
+├── routers/                     # health.py, documents.py (upload/process/embed/search/clauses),
+│                                  # qa.py (ask/chat)
+├── services/                      # llm_service.py (LLMProvider interface + StubLLMProvider +
+│                                    # GroqLLMProvider), extraction_service.py, document_service.py
+│                                    # (upload/process/embed/search orchestration),
+│                                    # contract_gate_service.py, cleaning_service.py,
+│                                    # chunking_service.py, embedding_service.py,
+│                                    # vector_store_service.py, retrieval_service.py (hybrid
+│                                    # retrieve() + is_relevant(), shared by search/ask/clauses),
+│                                    # citation_verification.py (shared JSON-parsing + citation
+│                                    # verification, used by qa_service and clause_service),
+│                                    # qa_service.py, clause_service.py
+├── prompts/                        # contract_gate_prompt.py, qa_prompt.py, clause_detection_prompt.py
+└── utils/                           # file_validation.py
 ```
 
-`app/db/chunk_repository.py` holds Chunk-specific queries (list-by-document,
-replace-for-document), kept out of the generic `Repository` per its own
-docstring — model-specific query logic gets its own module.
+`app/db/chunk_repository.py`, `chat_repository.py`, and `analysis_repository.py`
+each hold model-specific queries (list-by-document, replace-for-document),
+kept out of the generic `Repository` per its own docstring.
 
 Note: `document_service.py` isn't named in the original sprint plan but follows
 directly from the stated layering rule (routers thin, services orchestrate) —
 it owns save-to-disk + extraction + DB persistence so `routers/documents.py`
-stays a pure parse-call-return layer.
+stays a pure parse-call-return layer. Likewise `qa_service.py` and
+`clause_service.py` are called directly from their routers rather than via
+`document_service`, since routing every call through a pass-through layer
+would add indirection without value.
 
 ## Coding conventions
 
@@ -370,16 +382,88 @@ response shape is unchanged; only its content differs when citations fail)
 and no architecture was rewritten — this was inspection + targeted fixes
 against the existing implementation.
 
-**Next up — Sprint 6 (Clause Detection & Structured Analysis):** `POST
-/documents/{id}/analyze-clauses` scans the ~20-clause taxonomy, doing a
-targeted retrieval + LLM call per clause type (skipping types with no
-close-enough match), returning `{clause_type, found,
-plain_language_explanation, risk_level, why_it_matters, citation,
-recommendation}` per type — reusing the retrieve → prompt → LLM →
-verify-citation pattern established in Sprint 5. Needs `app/core/
-clause_taxonomy.py` (fixed Enum of clause types + risk levels),
-`app/services/clause_service.py`, `app/prompts/
-clause_detection_prompt.py`, `app/models/analysis.py` (`ClauseAnalysis`),
-`app/schemas/clause.py`, plus `GET /documents/{id}/clauses`. Re-running
-must replace prior results per document_id+clause_type (same
-idempotency pattern as chunk/vector replacement).
+**Sprint 6 — COMPLETE.** `POST /documents/{id}/analyze-clauses` scans the
+fixed 20-clause taxonomy (`app/core/clause_taxonomy.py` — `ClauseType`,
+`RiskLevel`, `CLAUSE_INFO` labels/descriptions, `CLAUSE_SEARCH_QUERIES`
+aliases) and `GET /documents/{id}/clauses` lists persisted results.
+`ClauseAnalysis` (`app/models/analysis.py`) has a `UniqueConstraint` on
+`(document_id, clause_type)` as defense-in-depth alongside
+`ClauseAnalysisRepository.replace_for_document`'s delete-then-insert
+strategy (`app/db/analysis_repository.py`) — the same idempotency pattern
+as chunks/vectors.
+
+Retrieval-first, not 20 unconditional LLM calls: `clause_service.
+_analyze_one_clause()` queries every alias for a clause type through the
+existing `retrieval_service.retrieve()` (reused unchanged), merges
+candidates by `chunk_id` keeping each one's best `combined_score` across
+aliases, and only calls the LLM if the best merged candidate clears
+`retrieval_service.is_relevant()` — otherwise the clause is stored
+`present=false` with no LLM call at all. `is_relevant()` and its
+thresholds (`MAX_DISTANCE_FOR_RELEVANCE`, `MIN_KEYWORD_SCORE_FOR_RELEVANCE`)
+were extracted out of `qa_service` into `retrieval_service` specifically
+so both consumers share one bar for "is this evidence good enough to act
+on" — `qa_service` was refactored to call the shared version, no behavior
+change there. Likewise, JSON-parsing and citation-verification logic
+(Markdown-fence tolerance, shape validation, verbatim quote checking) was
+extracted from `qa_service` into a new `app/services/
+citation_verification.py`, used by both `qa_service` and `clause_service`.
+
+Grounding: if the model claims `present=true` but none of its citations
+verify against the retrieved chunk text, the result is stored as absent,
+not as an unsupported "present" finding. `risk_level` is validated against
+`RiskLevel`'s fixed values (falling back to `"unknown"` for anything else)
+and the prompt (`app/prompts/clause_detection_prompt.py`) explicitly frames
+`risk_level`/`risk_explanation` as a heuristic review signal, not legal
+advice — this framing is also repeated in the README disclaimer.
+
+Verified live against `agreement_doc1.pdf` (see `resources/`): 16 of 20
+clause types correctly detected present with grounded citations (e.g.
+`payment` cited the same Allowable Deductions chunks found in the
+retrieval-quality fix; `confidentiality` correctly cited a cross-reference
+to a separate NDA rather than fabricating clause text); `force_majeure`,
+`non_compete`, `non_solicitation`, and `obligations` correctly came back
+absent. Re-running against the same document kept exactly 20 rows (20
+distinct `clause_type` values, no duplicates) both before and after a
+second run.
+
+**Known limitations observed:**
+- In this live run, all 20 clause types happened to clear the
+  `is_relevant()` gate and triggered an LLM call (confirmed via Groq
+  request logs: 20 successful completions) — the 4 "absent" results came
+  from the LLM's own judgment, not the retrieval-gate skip. The skip path
+  itself *is* correctly exercised and passing in the automated test suite
+  (`test_absent_clause_skips_llm_call`, `test_no_candidates_at_all_skips_
+  llm_call`), using deliberately irrelevant chunks — but this particular
+  document's broad shared vocabulary meant no clause-type alias came back
+  with literally zero evidence. Short 1–2-token aliases (e.g.
+  `"non-compete"` → tokens `["non", "compete"]`) are especially prone to
+  this: a single common-word partial match (e.g. any chunk containing
+  "non-exclusive") can cross the 0.5 keyword-score threshold on its own.
+  Not incorrect (the LLM still correctly says "not present"), but weaker
+  as a cost-saving gate for short aliases than for longer, more specific
+  ones. Worth revisiting (e.g. weighting rarer tokens higher, similar to
+  TF-IDF) if LLM-call volume becomes a real cost concern.
+- Sprint 5.1 added an automated test for chunk-replacement idempotency,
+  but not yet for Chroma vector-upsert idempotency — recorded as a known
+  gap, not blocking, per explicit instruction when this sprint was
+  assigned.
+- The Groq free tier has a daily token quota (100k Tokens Per Day on the
+  tier used during development); heavy same-day testing (multiple full
+  20-clause analysis runs plus `/ask` calls) can hit `429
+  rate_limit_exceeded`. The Groq SDK auto-retries transient 429s
+  internally, but a hard daily-quota 429 propagates as a clean 500 (no
+  raw stack trace to the client, per guardrail #5) rather than succeeding.
+  Not a code bug — an external operational constraint worth knowing about
+  when testing multiple sprints' worth of LLM calls in one day.
+
+**Next up — Sprint 7 (Contract-Level Summary & Risk Aggregation):** `POST
+/documents/{id}/summarize` — contract type classification, parties/dates/
+obligations extraction from a curated chunk set (preamble + chunks already
+tagged to `parties`/`effective_date` from Sprint 6's `ClauseAnalysis`
+results), and a risk rollup computed in code from `ClauseAnalysis.
+risk_level` counts (not re-asked of the LLM) plus a short LLM-written
+narrative from that computed breakdown. Needs `app/services/
+summary_service.py`, `app/prompts/summary_prompt.py`, `app/schemas/
+summary.py`, extending `app/models/analysis.py` with `ContractSummary`,
+plus `GET /documents/{id}/summary` and a convenience `GET
+/documents/{id}/full-report`.

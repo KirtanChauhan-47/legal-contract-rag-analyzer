@@ -12,12 +12,13 @@ content it wasn't shown.
 
 ## Current status
 
-**Sprints 1–5 complete, plus a Sprint 5.1 hardening pass.** The full pipeline
-works end-to-end: upload → extract → gate/clean/chunk → embed → hybrid
-search → grounded Q&A with citations and chat history. Clause-level
-detection, contract-type classification, and contract-level summaries are
-**not yet implemented** (planned for Sprints 6–7) — see `CLAUDE.md` for the
-full sprint plan and living status notes.
+**Sprints 1–6 complete, plus a Sprint 5.1 hardening pass.** The full
+pipeline works end-to-end: upload → extract → gate/clean/chunk → embed →
+hybrid search → grounded Q&A with citations and chat history → clause-level
+detection and risk analysis across a fixed 20-clause taxonomy. Contract-type
+classification and a contract-level summary/risk rollup are **not yet
+implemented** (planned for Sprint 7) — see `CLAUDE.md` for the full sprint
+plan and living status notes.
 
 ## Pipeline
 
@@ -29,6 +30,7 @@ upload → extract text (PyMuPDF / python-docx / plain read)
        → embed (all-MiniLM-L6-v2, stored in ChromaDB)
        → hybrid retrieval (vector similarity + exact-phrase + keyword score)
        → RAG Q&A (Groq LLM, citations verified against source chunks)
+       → clause detection (20-clause taxonomy, retrieval-first, grounded)
 ```
 
 Every document moves through an explicit status machine: `uploaded →
@@ -51,6 +53,8 @@ called out of order — e.g. you can't `/embed` a document that hasn't been
 | GET | `/documents/{id}/search?q=...` | Debug endpoint: hybrid semantic search, no LLM involved |
 | POST | `/documents/{id}/ask` | RAG Q&A — grounded answer with verified citations |
 | GET | `/documents/{id}/chat` | Full chat history for a document |
+| POST | `/documents/{id}/analyze-clauses` | Detect and analyze all 20 clause types (retrieval-first, grounded) |
+| GET | `/documents/{id}/clauses` | List persisted clause analysis results |
 
 All endpoints are testable directly via Swagger UI at `/docs` — no frontend
 exists or is planned for the near term.
@@ -103,6 +107,28 @@ regression queries used to verify it.
 - Chat sessions are scoped to the document they were created for — a
   session UUID from one document is rejected (409) if used against another
   document's `/ask`.
+
+## Clause detection design
+
+`analyze-clauses` checks a fixed 20-clause taxonomy (`app/core/
+clause_taxonomy.py`) — confidentiality, termination, governing law,
+jurisdiction, payment, limitation of liability, indemnification,
+non-compete, non-solicitation, IP, dispute resolution, renewal,
+assignment, force majeure, data protection, notices, warranties,
+obligations, effective date, and parties. It is **not** 20 unconditional
+LLM calls: for each clause type, one or more targeted search-query aliases
+retrieve candidate chunks through the same hybrid `retrieval_service.
+retrieve()` used by `/search` and `/ask`; the LLM is only called if the
+best candidate clears `retrieval_service.is_relevant()` (exact phrase,
+strong keyword overlap, or close vector distance). If nothing plausible is
+found, the clause is stored `present=false` with no LLM call at all. If
+the model claims a clause is present but none of its citations verify
+against the retrieved text, the result is stored as absent rather than as
+an unsupported finding — the same grounding discipline as `/ask`.
+
+**`risk_level` is a heuristic review signal, not a legal risk assessment.**
+It's meant to help a human reviewer decide what to look at closely — it
+does not carry legal authority and should not be treated as such.
 
 ## Setup
 
@@ -171,6 +197,13 @@ curl -X POST http://127.0.0.1:8000/documents/1/ask \
   -H "Content-Type: application/json" \
   -d '{"question": "How can this agreement be terminated?"}'
 # -> {"session_id": "...", "answer": "...", "citations": [...]}
+
+# 7. Detect and analyze all 20 clause types
+curl -X POST http://127.0.0.1:8000/documents/1/analyze-clauses
+# -> [{"clause_type": "termination", "present": true, "risk_level": "medium", ...}, ...]
+
+# 8. Inspect persisted clause results any time afterward
+curl http://127.0.0.1:8000/documents/1/clauses
 ```
 
 `resources/` contains sample contracts (and a non-contract text) for
@@ -183,21 +216,33 @@ exactly this kind of manual testing — see `resources/README.md`.
   chunk heading detection is regex-based and can occasionally misjudge
   unusual formatting.
 - **Retrieval relevance thresholds are empirically tuned**, not
-  principled — `MAX_DISTANCE_FOR_ANSWER` and
-  `MIN_KEYWORD_SCORE_FOR_ANSWER` (`app/services/qa_service.py`) were set by
-  observing real query/document pairs, not derived analytically, and may
-  need retuning against more varied documents.
+  principled — `MAX_DISTANCE_FOR_RELEVANCE` and
+  `MIN_KEYWORD_SCORE_FOR_RELEVANCE` (`app/services/retrieval_service.py`)
+  were set by observing real query/document pairs, not derived
+  analytically, and may need retuning against more varied documents.
 - **PDF text extraction has a known font-encoding artifact** on at least
   one tested document: semicolons render as `Í¾` in extracted text. Cosmetic
   — citation verification still works since the artifact is consistent
   between stored and quoted text — but not fixed.
-- **No clause-level detection, contract-type classification, or
-  contract-level summary yet** (Sprints 6–7).
+- **No contract-type classification or contract-level summary yet**
+  (Sprint 7).
+- **The clause-relevance gate is weaker for short 1–2-word aliases** (e.g.
+  `"non-compete"` → tokens `["non", "compete"]`) — a single common-word
+  partial match can cross the keyword-overlap threshold on its own,
+  meaning the LLM still gets called even when the clause plausibly isn't
+  present (the LLM itself then correctly reports it absent, so results
+  stay correct, but the cost-saving skip is less effective for these
+  clause types than for longer, more specific ones).
 - **No auth, rate limiting, Docker, or Alembic migrations** — intentionally
   out of scope for now (see `CLAUDE.md`'s hard guardrails).
 - **SQLite is a development database**, not intended for concurrent
   multi-user production use as-is (though models are written to be
   Postgres-portable).
+- **Groq's free tier has a daily token quota** — heavy same-day testing
+  (e.g. multiple full 20-clause analysis runs) can hit a `429
+  rate_limit_exceeded`, which surfaces as a clean 500 rather than a raw
+  crash, but does mean `/analyze-clauses` can temporarily fail for
+  reasons outside this app's control.
 
 ## Project layout
 
