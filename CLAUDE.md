@@ -603,14 +603,59 @@ reuse ever needs to be ruled out categorically, `sqlite_autoincrement`
 on `Chunk.__table_args__` is the fix; not applied here since it wasn't
 needed for a real observed problem.
 
-**Next up — Sprint 7 (Contract-Level Summary & Risk Aggregation):** `POST
-/documents/{id}/summarize` — contract type classification, parties/dates/
-obligations extraction from a curated chunk set (preamble + chunks already
-tagged to `parties`/`effective_date` from Sprint 6's `ClauseAnalysis`
-results), and a risk rollup computed in code from `ClauseAnalysis.
-risk_level` counts (not re-asked of the LLM) plus a short LLM-written
-narrative from that computed breakdown. Needs `app/services/
-summary_service.py`, `app/prompts/summary_prompt.py`, `app/schemas/
-summary.py`, extending `app/models/analysis.py` with `ContractSummary`,
-plus `GET /documents/{id}/summary` and a convenience `GET
-/documents/{id}/full-report`.
+**Sprint 7 — COMPLETE.** `POST /documents/{id}/summarize` requires
+`status=analyzed` (clear 409 otherwise, pointing at `/analyze-clauses`)
+and produces: contract-type classification (`app/core/
+contract_taxonomy.py`'s fixed `ContractType` enum — NDA/Employment/
+Service/Consulting/Vendor/Lease/Licensing/Partnership/Purchase/
+General Business), parties, effective/expiration dates, and key
+obligations, all extracted from a small curated chunk set (leading
+preamble chunks + chunks already cited by the `parties`/`effective_date`
+`ClauseAnalysis` rows — never the whole document), plus a risk rollup.
+
+**Risk counts are computed in code**, not asked of the LLM:
+`summary_service._compute_risk_counts()` tallies `ClauseAnalysis.
+risk_level` across only `present=true` rows (an absent clause's
+risk_level is always "unknown" and would just be noise). Only a short
+narrative sentence is LLM-generated from that already-computed breakdown
+plus any high-risk clause explanations — the numbers themselves can never
+be hallucinated by the narrative call.
+
+Two LLM calls per `/summarize`, with deliberately different failure
+behavior: the **extraction** call (contract type/parties/dates) is not
+caught — a rate limit propagates as a real 429, consistent with `/ask`
+and `/analyze-clauses`, since a "successful but silently empty" summary
+would be misleading. The **narrative** call *is* caught (`RateLimitedError`/
+`NotImplementedError` only, not arbitrary exceptions) and falls back to a
+templated sentence built from the already-solid `risk_counts` — a cheap
+prose embellishment isn't worth failing an otherwise-complete summary
+over. Extraction citations are verified the same way as everywhere else
+(`citation_verification.verify_citations`); zero verified citations means
+safe defaults (`general_business`, no parties, no dates), never a
+plausible-looking but ungrounded guess.
+
+`ContractSummary` is one row per document (`document_id` unique) updated
+in place via `ContractSummaryRepository.upsert()` — no delete-then-insert
+needed since there's no multi-row taxonomy to replace, unlike
+`ClauseAnalysis`. `GET /documents/{id}/summary` (404 if not yet run) and
+`GET /documents/{id}/full-report` (document metadata minus `raw_text` +
+summary + all clause analyses in one response) round out the endpoints.
+
+Verified live against `agreement_doc1.pdf`: correctly classified as
+`licensing`; parties correctly identified as WPT Enterprises (licensor)
+and Zynga Inc/Zynga Game Ireland Limited (licensees); effective date
+correctly extracted as "February 1, 2018"; `risk_counts` (`low: 7,
+medium: 9, high: 0`) matched the persisted `ClauseAnalysis` data exactly,
+confirming the rollup is genuinely code-computed, not LLM-fabricated;
+re-running `/summarize` twice left exactly one `contract_summaries` row
+(update-in-place, not duplicated); `/summarize` on a document still at
+`embedded` status correctly returned a clean 409 pointing at
+`/analyze-clauses`.
+
+**All 8 planned sprints are now complete.** Remaining open items are
+Sprint 8-style hardening/polish, not new features — see the "Known
+limitations" notes throughout this file (no `DELETE /documents/{id}`
+yet, no auth/rate limiting, extraction/gate/chunking edge cases are
+manually- not automatically-tested, Chroma vector-upsert idempotency has
+no automated test, the relevance gate's short-alias weakness is recorded
+but not fixed, and the PDF font-encoding artifact is unaddressed).

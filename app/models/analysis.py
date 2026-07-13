@@ -46,3 +46,26 @@ class ClauseAnalysisRun(Base):
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ContractSummary(Base):
+    """One row per document (document_id is unique) -- contract-level
+    classification, parties/dates/obligations, and a risk rollup. Risk
+    counts are computed in code from ClauseAnalysis.risk_level, not
+    re-asked of the LLM; only risk_summary_narrative is LLM-generated."""
+
+    __tablename__ = "contract_summaries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id"), unique=True, index=True)
+
+    contract_type: Mapped[str] = mapped_column(String(30))
+    parties: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    effective_date: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    expiration_date: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    key_obligations: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    risk_summary_narrative: Mapped[str | None] = mapped_column(Text, nullable=True)
+    risk_counts: Mapped[dict] = mapped_column(JSON)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

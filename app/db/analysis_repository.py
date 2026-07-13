@@ -4,7 +4,7 @@ module."""
 from sqlalchemy.orm import Session
 
 from app.db.repository import Repository
-from app.models.analysis import ClauseAnalysis, ClauseAnalysisRun
+from app.models.analysis import ClauseAnalysis, ClauseAnalysisRun, ContractSummary
 
 
 class ClauseAnalysisRepository(Repository[ClauseAnalysis]):
@@ -46,3 +46,25 @@ class ClauseAnalysisRunRepository(Repository[ClauseAnalysisRun]):
         else:
             existing.fingerprint = fingerprint
             existing.model = model
+
+
+class ContractSummaryRepository(Repository[ContractSummary]):
+    def __init__(self, db: Session):
+        super().__init__(db, ContractSummary)
+
+    def get_for_document(self, document_id: int) -> ContractSummary | None:
+        return self.db.query(ContractSummary).filter(ContractSummary.document_id == document_id).first()
+
+    def upsert(self, document_id: int, fields: dict) -> ContractSummary:
+        """Updates the existing summary in place, or creates one -- a
+        document has at most one summary (unique document_id), so this is
+        naturally idempotent without a delete-then-insert step. Does not
+        commit -- caller controls the transaction."""
+        existing = self.get_for_document(document_id)
+        if existing is None:
+            summary = ContractSummary(document_id=document_id, **fields)
+            self.db.add(summary)
+            return summary
+        for key, value in fields.items():
+            setattr(existing, key, value)
+        return existing

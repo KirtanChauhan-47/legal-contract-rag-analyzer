@@ -5,7 +5,8 @@ from app.db.session import get_db
 from app.schemas.chunk import ChunkRead, ChunkSearchResult
 from app.schemas.clause import ClauseAnalysisRead
 from app.schemas.document import DocumentListItem, DocumentRead, DocumentUploadResponse
-from app.services import clause_service, document_service
+from app.schemas.summary import ContractSummaryRead, FullReportRead
+from app.services import clause_service, document_service, summary_service
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -82,3 +83,21 @@ def analyze_clauses(
 @router.get("/{document_id}/clauses", response_model=list[ClauseAnalysisRead])
 def get_clauses(document_id: int, db: Session = Depends(get_db)):
     return clause_service.get_clauses(db, document_id)
+
+
+@router.post("/{document_id}/summarize", response_model=ContractSummaryRead)
+def summarize_document(document_id: int, db: Session = Depends(get_db)):
+    return summary_service.summarize(db, document_id)
+
+
+@router.get("/{document_id}/summary", response_model=ContractSummaryRead)
+def get_summary(document_id: int, db: Session = Depends(get_db)):
+    return summary_service.get_summary(db, document_id)
+
+
+@router.get("/{document_id}/full-report", response_model=FullReportRead)
+def get_full_report(document_id: int, db: Session = Depends(get_db)):
+    report = summary_service.get_full_report(db, document_id)
+    document_data = DocumentRead.model_validate(report["document"])
+    document_data.raw_text = None
+    return FullReportRead(document=document_data, summary=report["summary"], clauses=report["clauses"])

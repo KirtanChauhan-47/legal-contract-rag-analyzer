@@ -12,13 +12,15 @@ content it wasn't shown.
 
 ## Current status
 
-**Sprints 1–6 complete, plus a Sprint 5.1 hardening pass.** The full
-pipeline works end-to-end: upload → extract → gate/clean/chunk → embed →
-hybrid search → grounded Q&A with citations and chat history → clause-level
-detection and risk analysis across a fixed 20-clause taxonomy. Contract-type
-classification and a contract-level summary/risk rollup are **not yet
-implemented** (planned for Sprint 7) — see `CLAUDE.md` for the full sprint
-plan and living status notes.
+**All 8 planned sprints are complete** (plus 5.1, 6.1, and 6.1.1 hardening
+passes). The full pipeline works end-to-end: upload → extract →
+gate/clean/chunk → embed → hybrid search → grounded Q&A with citations and
+chat history → clause-level detection and risk analysis across a fixed
+20-clause taxonomy → contract-type classification, parties/dates
+extraction, and a code-computed risk rollup with a short LLM narrative.
+What's left is Sprint-8-style hardening/polish (a `DELETE` endpoint, auth,
+more automated edge-case tests), not new features — see `CLAUDE.md` for
+the full sprint history and known limitations.
 
 ## Pipeline
 
@@ -31,6 +33,7 @@ upload → extract text (PyMuPDF / python-docx / plain read)
        → hybrid retrieval (vector similarity + exact-phrase + keyword score)
        → RAG Q&A (Groq LLM, citations verified against source chunks)
        → clause detection (20-clause taxonomy, retrieval-first, grounded)
+       → contract summary (type, parties, dates, code-computed risk rollup)
 ```
 
 Every document moves through an explicit status machine: `uploaded →
@@ -53,8 +56,11 @@ called out of order — e.g. you can't `/embed` a document that hasn't been
 | GET | `/documents/{id}/search?q=...` | Debug endpoint: hybrid semantic search, no LLM involved |
 | POST | `/documents/{id}/ask` | RAG Q&A — grounded answer with verified citations |
 | GET | `/documents/{id}/chat` | Full chat history for a document |
-| POST | `/documents/{id}/analyze-clauses` | Detect and analyze all 20 clause types (retrieval-first, grounded) |
+| POST | `/documents/{id}/analyze-clauses?force=false` | Detect and analyze all 20 clause types (retrieval-first, grounded, cached) |
 | GET | `/documents/{id}/clauses` | List persisted clause analysis results |
+| POST | `/documents/{id}/summarize` | Classify contract type, extract parties/dates, compute risk rollup |
+| GET | `/documents/{id}/summary` | Fetch the persisted contract summary |
+| GET | `/documents/{id}/full-report` | Document metadata + summary + all clause analyses in one response |
 
 All endpoints are testable directly via Swagger UI at `/docs` — no frontend
 exists or is planned for the near term.
@@ -204,6 +210,13 @@ curl -X POST http://127.0.0.1:8000/documents/1/analyze-clauses
 
 # 8. Inspect persisted clause results any time afterward
 curl http://127.0.0.1:8000/documents/1/clauses
+
+# 9. Classify the contract, extract parties/dates, and roll up risk
+curl -X POST http://127.0.0.1:8000/documents/1/summarize
+# -> {"contract_type": "...", "parties": [...], "risk_counts": {...}, ...}
+
+# 10. Get everything in one response
+curl http://127.0.0.1:8000/documents/1/full-report
 ```
 
 `resources/` contains sample contracts (and a non-contract text) for
@@ -224,8 +237,6 @@ exactly this kind of manual testing — see `resources/README.md`.
   one tested document: semicolons render as `Í¾` in extracted text. Cosmetic
   — citation verification still works since the artifact is consistent
   between stored and quoted text — but not fixed.
-- **No contract-type classification or contract-level summary yet**
-  (Sprint 7).
 - **The clause-relevance gate is weaker for short 1–2-word aliases** (e.g.
   `"non-compete"` → tokens `["non", "compete"]`) — a single common-word
   partial match can cross the keyword-overlap threshold on its own,
@@ -240,9 +251,15 @@ exactly this kind of manual testing — see `resources/README.md`.
   Postgres-portable).
 - **Groq's free tier has a daily token quota** — heavy same-day testing
   (e.g. multiple full 20-clause analysis runs) can hit a `429
-  rate_limit_exceeded`, which surfaces as a clean 500 rather than a raw
-  crash, but does mean `/analyze-clauses` can temporarily fail for
-  reasons outside this app's control.
+  rate_limit_exceeded`, which surfaces as a clean HTTP 429 (`rate_limited`,
+  with a `Retry-After` header when Groq provides one) rather than a raw
+  crash, but does mean `/analyze-clauses`/`/summarize` can temporarily
+  fail for reasons outside this app's control. `/analyze-clauses` caches
+  its result (see `?force=false`) to avoid re-spending quota on repeated
+  calls against an unchanged document.
+- **No `DELETE /documents/{id}` endpoint yet** — no way to remove a
+  document's SQL rows, Chroma vectors, and uploaded file together
+  (Sprint 8 item).
 
 ## Project layout
 
