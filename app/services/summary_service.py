@@ -47,6 +47,12 @@ def summarize(db: Session, document_id: int) -> ContractSummary:
     clause_rows = ClauseAnalysisRepository(db).list_by_document(document_id)
     if not clause_rows:
         raise ConflictError(f"Document {document_id} has no clause analysis results to summarize from.")
+    if not _covers_full_taxonomy(clause_rows):
+        raise ConflictError(
+            f"Document {document_id}'s clause analysis is incomplete: expected exactly one result for "
+            f"each of the {len(ClauseType)} clause types, found {len(clause_rows)}. Re-run "
+            f"POST /documents/{document_id}/analyze-clauses?force=true before summarizing."
+        )
 
     extraction_chunks = _gather_extraction_chunks(db, document_id, clause_rows)
     extraction = _extract_contract_details(extraction_chunks)
@@ -60,6 +66,7 @@ def summarize(db: Session, document_id: int) -> ContractSummary:
         "effective_date": extraction["effective_date"],
         "expiration_date": extraction["expiration_date"],
         "key_obligations": extraction["key_obligations"],
+        "citations": extraction["citations"],
         "risk_summary_narrative": narrative,
         "risk_counts": risk_counts,
     }
@@ -86,6 +93,17 @@ def get_full_report(db: Session, document_id: int) -> dict:
     clauses = ClauseAnalysisRepository(db).list_by_document(document_id)
     summary = ContractSummaryRepository(db).get_for_document(document_id)
     return {"document": document, "summary": summary, "clauses": clauses}
+
+
+def _covers_full_taxonomy(clause_rows) -> bool:
+    """A document is only safe to summarize once its clause analysis has
+    exactly one result per ClauseType -- no fewer (an incomplete/interrupted
+    run) and no more (a duplicate) -- otherwise the risk rollup and
+    extraction-chunk selection (which both read from these rows) would be
+    working from a partial or corrupted picture."""
+    if len(clause_rows) != len(ClauseType):
+        return False
+    return {row.clause_type for row in clause_rows} == {clause_type.value for clause_type in ClauseType}
 
 
 def _gather_extraction_chunks(db: Session, document_id: int, clause_rows) -> list[dict]:
@@ -122,6 +140,7 @@ def _default_extraction() -> dict:
         "effective_date": None,
         "expiration_date": None,
         "key_obligations": [],
+        "citations": [],
     }
 
 
@@ -172,6 +191,7 @@ def _parse_extraction_response(raw_response: str, chunks: list[dict]) -> dict:
         "effective_date": effective_date,
         "expiration_date": expiration_date,
         "key_obligations": key_obligations,
+        "citations": verified_citations,
     }
 
 

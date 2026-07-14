@@ -1,9 +1,10 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from app.schemas.clause import ClauseAnalysisRead
 from app.schemas.document import DocumentRead
+from app.schemas.qa import CitationOut
 
 
 class PartyOut(BaseModel):
@@ -25,10 +26,19 @@ class ContractSummaryRead(BaseModel):
     effective_date: str | None
     expiration_date: str | None
     key_obligations: list[ObligationOut]
+    citations: list[CitationOut]
     risk_summary_narrative: str | None
     risk_counts: dict[str, int]
     created_at: datetime
     updated_at: datetime
+
+    @field_validator("citations", mode="before")
+    @classmethod
+    def _default_citations_to_empty_list(cls, value):
+        # Rows persisted before Sprint 7.1 (or the SQLite ALTER TABLE
+        # backfill) may have NULL here -- treat as "no citations", not a
+        # validation error.
+        return value or []
 
 
 class FullReportRead(BaseModel):

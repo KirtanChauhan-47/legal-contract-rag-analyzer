@@ -652,6 +652,67 @@ re-running `/summarize` twice left exactly one `contract_summaries` row
 `embedded` status correctly returned a clean 409 pointing at
 `/analyze-clauses`.
 
+**Sprint 7.1 — COMPLETE.** A small grounding/completeness refinement on
+top of Sprint 7, requested after review — no changes to retrieval,
+chunking, embeddings, caching, clause taxonomy, or model selection.
+
+1. **Summary extraction citations are now preserved, not discarded.**
+   `ContractSummary` gained a `citations` JSON column (`app/models/
+   analysis.py`) holding the same verified `{chunk_id, quote}` citations
+   already computed by `_parse_extraction_response`'s `verify_citations`
+   call — previously computed only to decide "trust this extraction or
+   fall back to defaults" and then thrown away. `ContractSummaryRead`
+   (`app/schemas/summary.py`) now exposes `citations: list[CitationOut]`
+   (reusing the existing `app/schemas/qa.py` type, same as
+   `ClauseAnalysisRead`), returned from both `GET /documents/{id}/summary`
+   and `GET /documents/{id}/full-report`. Only ever the already-verified
+   list is stored — never raw/unverified LLM citations — consistent with
+   every other citation path in the app. A `field_validator` on the schema
+   maps a `None` value (e.g. any pre-migration row) to `[]` rather than
+   failing validation.
+2. **`summarize()` now requires a complete clause analysis before
+   running**, not just a non-empty one. `_covers_full_taxonomy()`
+   (`app/services/summary_service.py`, same check/shape as
+   `clause_service._covers_full_taxonomy` from Sprint 6.1.1, duplicated
+   rather than imported to avoid coupling the two services) requires
+   exactly one `ClauseAnalysis` row per `ClauseType` — no fewer (an
+   interrupted/partial `analyze-clauses` run) and no more (a duplicate,
+   which in practice can't happen given the DB `UniqueConstraint`, but is
+   still checked as defense-in-depth). An incomplete set now raises a
+   `ConflictError` (409) pointing at re-running `/analyze-clauses?
+   force=true`, instead of silently summarizing from a partial risk/clause
+   picture.
+3. **Schema migration note:** `citations` is a new column on the
+   already-existing `contract_summaries` table — `Base.metadata.
+   create_all()` does not add columns to tables that already exist (only
+   new tables), so this required an explicit, additive `ALTER TABLE
+   contract_summaries ADD COLUMN citations JSON DEFAULT '[]'` run directly
+   against the real `legal_rag.db` (SQLite backfills existing rows with a
+   literal `DEFAULT` on `ADD COLUMN`, confirmed live: the pre-existing
+   summary row for document 2 came back with `citations: '[]'` immediately
+   after the migration, no data loss). Flagging this explicitly per the
+   project's schema-change convention, rather than quietly dropping/
+   recreating any table.
+
+**Tests added (8 new, 52 total passing):** verified citations persisted
+on `summarize()`, citations dropped to `[]` when none verify, the
+`ContractSummaryRead`/`FullReportRead` schemas surface citations
+correctly, `_covers_full_taxonomy` accepts a full set and rejects a
+duplicate+missing set (pure-function unit tests, same pattern as
+`clause_service`'s equivalent), an incomplete (partial-count) clause
+analysis raises `ConflictError`, and a complete 20-row set still succeeds.
+Existing Sprint 7 tests that previously seeded only 1-5 `ClauseAnalysis`
+rows were updated to seed a full 20-type taxonomy (via a new
+`_full_taxonomy_rows()` test helper) so they remain valid under the new
+completeness precondition — no test intent changed, only the seeded
+fixture data.
+
+**Verified live** against `agreement_doc1.pdf` (document_id 2, real Groq
+key): re-ran `/summarize` after the migration and got real verified
+citations back (the preamble sentence naming WPT/Zynga, and the Initial
+Term sentence) via both `GET /summary` and `GET /full-report`; confirmed
+`full-report` still returns all 20 clause rows.
+
 **All 8 planned sprints are now complete.** Remaining open items are
 Sprint 8-style hardening/polish, not new features — see the "Known
 limitations" notes throughout this file (no `DELETE /documents/{id}`

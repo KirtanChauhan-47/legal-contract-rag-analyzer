@@ -7,6 +7,7 @@ import json
 import pytest
 from conftest import make_document
 
+from app.core.clause_taxonomy import ClauseType
 from app.core.exceptions import ConflictError, NotFoundError, RateLimitedError
 from app.db.analysis_repository import ClauseAnalysisRepository, ContractSummaryRepository
 from app.db.chunk_repository import ChunkRepository
@@ -33,6 +34,18 @@ def _clause_row(clause_type: str, *, present: bool, risk_level: str = "unknown",
         "risk_explanation": risk_explanation,
         "citations": citations or [],
     }
+
+
+def _full_taxonomy_rows(overrides: dict[str, dict] | None = None) -> list[dict]:
+    """One absent row per ClauseType (i.e. a complete, valid clause
+    analysis), with any per-clause-type overrides layered on top."""
+    overrides = overrides or {}
+    rows = []
+    for clause_type in ClauseType:
+        row = _clause_row(clause_type.value, present=False)
+        row.update(overrides.get(clause_type.value, {}))
+        rows.append(row)
+    return rows
 
 
 class _FakeProvider:
@@ -75,10 +88,10 @@ def test_summarize_extracts_details_with_valid_citation(db_session, monkeypatch)
     db_session.commit()
     chunk = ChunkRepository(db_session).list_by_document(document.id)[0]
 
-    ClauseAnalysisRepository(db_session).replace_for_document(
-        document.id,
-        [_clause_row("parties", present=True, citations=[{"chunk_id": chunk.id, "quote": "Acme Corp and Beta LLC"}])],
+    rows = _full_taxonomy_rows(
+        {"parties": {"present": True, "citations": [{"chunk_id": chunk.id, "quote": "Acme Corp and Beta LLC"}]}}
     )
+    ClauseAnalysisRepository(db_session).replace_for_document(document.id, rows)
     db_session.commit()
 
     monkeypatch.setattr(
@@ -110,9 +123,8 @@ def test_summarize_falls_back_to_defaults_when_extraction_citations_invalid(db_s
     ChunkRepository(db_session).replace_for_document(document.id, [_chunk_dict(0, "Actual preamble text.", "preamble")])
     db_session.commit()
 
-    ClauseAnalysisRepository(db_session).replace_for_document(
-        document.id, [_clause_row("parties", present=False)]
-    )
+    rows = _full_taxonomy_rows()
+    ClauseAnalysisRepository(db_session).replace_for_document(document.id, rows)
     db_session.commit()
 
     monkeypatch.setattr(
@@ -144,16 +156,16 @@ def test_risk_counts_are_computed_in_code_not_from_llm(db_session, monkeypatch):
     ChunkRepository(db_session).replace_for_document(document.id, [_chunk_dict(0, "text", "1.")])
     db_session.commit()
 
-    ClauseAnalysisRepository(db_session).replace_for_document(
-        document.id,
-        [
-            _clause_row("termination", present=True, risk_level="high", risk_explanation="Onerous notice terms."),
-            _clause_row("payment", present=True, risk_level="medium"),
-            _clause_row("notices", present=True, risk_level="low"),
-            _clause_row("parties", present=True, risk_level="low"),
-            _clause_row("non_compete", present=False),  # absent -- must not pollute risk_counts
-        ],
+    rows = _full_taxonomy_rows(
+        {
+            "termination": {"present": True, "risk_level": "high", "risk_explanation": "Onerous notice terms."},
+            "payment": {"present": True, "risk_level": "medium"},
+            "notices": {"present": True, "risk_level": "low"},
+            "parties": {"present": True, "risk_level": "low"},
+            # non_compete stays absent (the default) -- must not pollute risk_counts
+        }
     )
+    ClauseAnalysisRepository(db_session).replace_for_document(document.id, rows)
     db_session.commit()
 
     # The narrative LLM call is instructed not to alter the counts -- but
@@ -175,9 +187,10 @@ def test_narrative_falls_back_when_llm_unavailable(db_session, monkeypatch):
     # test_summarize_propagates_rate_limit_from_extraction below).
     document = make_document(db_session, filename="doc.txt", status="analyzed")
 
-    ClauseAnalysisRepository(db_session).replace_for_document(
-        document.id, [_clause_row("termination", present=True, risk_level="high", risk_explanation="Risky.")]
+    rows = _full_taxonomy_rows(
+        {"termination": {"present": True, "risk_level": "high", "risk_explanation": "Risky."}}
     )
+    ClauseAnalysisRepository(db_session).replace_for_document(document.id, rows)
     db_session.commit()
 
     monkeypatch.setattr(summary_service, "get_llm_provider", lambda: _RateLimitedProvider())
@@ -197,9 +210,8 @@ def test_summarize_propagates_rate_limit_from_extraction(db_session, monkeypatch
     ChunkRepository(db_session).replace_for_document(document.id, [_chunk_dict(0, "Some preamble text.", "preamble")])
     db_session.commit()
 
-    ClauseAnalysisRepository(db_session).replace_for_document(
-        document.id, [_clause_row("termination", present=True, risk_level="low")]
-    )
+    rows = _full_taxonomy_rows({"termination": {"present": True, "risk_level": "low"}})
+    ClauseAnalysisRepository(db_session).replace_for_document(document.id, rows)
     db_session.commit()
 
     monkeypatch.setattr(summary_service, "get_llm_provider", lambda: _RateLimitedProvider())
@@ -213,9 +225,8 @@ def test_rerunning_summarize_updates_in_place_not_duplicated(db_session, monkeyp
     ChunkRepository(db_session).replace_for_document(document.id, [_chunk_dict(0, "text", "1.")])
     db_session.commit()
 
-    ClauseAnalysisRepository(db_session).replace_for_document(
-        document.id, [_clause_row("termination", present=True, risk_level="low")]
-    )
+    rows = _full_taxonomy_rows({"termination": {"present": True, "risk_level": "low"}})
+    ClauseAnalysisRepository(db_session).replace_for_document(document.id, rows)
     db_session.commit()
 
     monkeypatch.setattr(summary_service, "get_llm_provider", lambda: _FakeProvider(json.dumps({"narrative": "First."})))
@@ -244,9 +255,8 @@ def test_get_full_report_combines_document_summary_and_clauses(db_session, monke
     ChunkRepository(db_session).replace_for_document(document.id, [_chunk_dict(0, "text", "1.")])
     db_session.commit()
 
-    ClauseAnalysisRepository(db_session).replace_for_document(
-        document.id, [_clause_row("termination", present=True, risk_level="low")]
-    )
+    rows = _full_taxonomy_rows({"termination": {"present": True, "risk_level": "low"}})
+    ClauseAnalysisRepository(db_session).replace_for_document(document.id, rows)
     db_session.commit()
 
     monkeypatch.setattr(summary_service, "get_llm_provider", lambda: _FakeProvider(json.dumps({"narrative": "n"})))
@@ -256,4 +266,217 @@ def test_get_full_report_combines_document_summary_and_clauses(db_session, monke
 
     assert report["document"].id == document.id
     assert report["summary"] is not None
-    assert len(report["clauses"]) == 1
+    assert len(report["clauses"]) == len(ClauseType)
+
+
+def test_incomplete_clause_analysis_returns_conflict(db_session):
+    document = make_document(db_session, filename="doc.txt", status="analyzed")
+    # Only 2 of the 20 ClauseType rows exist -- e.g. an interrupted or
+    # corrupted analyze-clauses run -- must be rejected, not silently
+    # summarized from a partial picture.
+    ClauseAnalysisRepository(db_session).replace_for_document(
+        document.id,
+        [
+            _clause_row(ClauseType.TERMINATION.value, present=True, risk_level="low"),
+            _clause_row(ClauseType.PAYMENT.value, present=False),
+        ],
+    )
+    db_session.commit()
+
+    with pytest.raises(ConflictError):
+        summary_service.summarize(db_session, document.id)
+
+
+class _FakeRow:
+    """Minimal stand-in for a ClauseAnalysis row -- only .clause_type is
+    needed to exercise _covers_full_taxonomy as a pure function. (A real
+    duplicate document_id+clause_type row can't be persisted at all, since
+    ClauseAnalysis has a UNIQUE constraint on that pair -- this checks the
+    defense-in-depth logic directly, same pattern as clause_service's own
+    _covers_full_taxonomy tests.)"""
+
+    def __init__(self, clause_type: str):
+        self.clause_type = clause_type
+
+
+def test_covers_full_taxonomy_rejects_duplicate_and_missing_clause_types():
+    clause_values = [ct.value for ct in ClauseType if ct != ClauseType.PARTIES]
+    clause_values.append(ClauseType.TERMINATION.value)
+    rows = [_FakeRow(value) for value in clause_values]
+
+    assert len(rows) == len(ClauseType)  # right count, wrong set
+    assert summary_service._covers_full_taxonomy(rows) is False
+
+
+def test_covers_full_taxonomy_accepts_exactly_one_row_per_clause_type():
+    rows = [_FakeRow(ct.value) for ct in ClauseType]
+    assert summary_service._covers_full_taxonomy(rows) is True
+
+
+def test_complete_clause_analysis_still_succeeds(db_session, monkeypatch):
+    document = make_document(db_session, filename="doc.txt", status="analyzed")
+    rows = _full_taxonomy_rows(
+        {ClauseType.TERMINATION.value: {"present": True, "risk_level": "low", "summary": "s"}}
+    )
+    ClauseAnalysisRepository(db_session).replace_for_document(document.id, rows)
+    db_session.commit()
+
+    monkeypatch.setattr(summary_service, "get_llm_provider", lambda: _FakeProvider(json.dumps({"narrative": "ok"})))
+
+    summary = summary_service.summarize(db_session, document.id)
+
+    assert summary.risk_summary_narrative == "ok"
+    assert summary.risk_counts["low"] == 1
+
+
+def test_summarize_persists_verified_citations(db_session, monkeypatch):
+    document = make_document(db_session, filename="doc.txt", status="analyzed")
+    ChunkRepository(db_session).replace_for_document(
+        document.id,
+        [_chunk_dict(0, "This Agreement is entered into by Acme Corp and Beta LLC.", "preamble")],
+    )
+    db_session.commit()
+    chunk = ChunkRepository(db_session).list_by_document(document.id)[0]
+
+    rows = _full_taxonomy_rows(
+        {
+            ClauseType.PARTIES.value: {
+                "present": True,
+                "citations": [{"chunk_id": chunk.id, "quote": "Acme Corp and Beta LLC"}],
+            }
+        }
+    )
+    ClauseAnalysisRepository(db_session).replace_for_document(document.id, rows)
+    db_session.commit()
+
+    monkeypatch.setattr(
+        summary_service,
+        "get_llm_provider",
+        lambda: _FakeProvider(
+            json.dumps(
+                {
+                    "contract_type": "service",
+                    "parties": [{"name": "Acme Corp", "role": "Provider"}],
+                    "effective_date": None,
+                    "expiration_date": None,
+                    "key_obligations": [],
+                    "citations": [
+                        {"chunk_id": chunk.id, "quote": "This Agreement is entered into by Acme Corp and Beta LLC."}
+                    ],
+                }
+            )
+        ),
+    )
+
+    summary = summary_service.summarize(db_session, document.id)
+
+    assert summary.citations == [
+        {"chunk_id": chunk.id, "quote": "This Agreement is entered into by Acme Corp and Beta LLC."}
+    ]
+
+
+def test_summarize_stores_no_citations_when_none_verify(db_session, monkeypatch):
+    document = make_document(db_session, filename="doc.txt", status="analyzed")
+    ChunkRepository(db_session).replace_for_document(document.id, [_chunk_dict(0, "Actual preamble text.", "preamble")])
+    db_session.commit()
+
+    rows = _full_taxonomy_rows()
+    ClauseAnalysisRepository(db_session).replace_for_document(document.id, rows)
+    db_session.commit()
+
+    monkeypatch.setattr(
+        summary_service,
+        "get_llm_provider",
+        lambda: _FakeProvider(
+            json.dumps(
+                {
+                    "contract_type": "nda",
+                    "parties": [],
+                    "effective_date": None,
+                    "expiration_date": None,
+                    "key_obligations": [],
+                    "citations": [{"chunk_id": 999, "quote": "does not appear anywhere"}],
+                }
+            )
+        ),
+    )
+
+    summary = summary_service.summarize(db_session, document.id)
+
+    assert summary.citations == []
+
+
+def test_summary_read_schema_includes_citations(db_session, monkeypatch):
+    from app.schemas.summary import ContractSummaryRead
+
+    document = make_document(db_session, filename="doc.txt", status="analyzed")
+    ChunkRepository(db_session).replace_for_document(
+        document.id, [_chunk_dict(0, "This Agreement is between Acme Corp and Beta LLC.", "preamble")]
+    )
+    db_session.commit()
+    chunk = ChunkRepository(db_session).list_by_document(document.id)[0]
+
+    rows = _full_taxonomy_rows()
+    ClauseAnalysisRepository(db_session).replace_for_document(document.id, rows)
+    db_session.commit()
+
+    monkeypatch.setattr(
+        summary_service,
+        "get_llm_provider",
+        lambda: _FakeProvider(
+            json.dumps(
+                {
+                    "contract_type": "nda",
+                    "parties": [],
+                    "effective_date": None,
+                    "expiration_date": None,
+                    "key_obligations": [],
+                    "citations": [{"chunk_id": chunk.id, "quote": "This Agreement is between Acme Corp and Beta LLC."}],
+                }
+            )
+        ),
+    )
+
+    summary_service.summarize(db_session, document.id)
+    summary = summary_service.get_summary(db_session, document.id)
+
+    schema = ContractSummaryRead.model_validate(summary)
+    assert len(schema.citations) == 1
+    assert schema.citations[0].chunk_id == chunk.id
+
+
+def test_full_report_includes_summary_citations(db_session, monkeypatch):
+    document = make_document(db_session, filename="doc.txt", status="analyzed")
+    ChunkRepository(db_session).replace_for_document(
+        document.id, [_chunk_dict(0, "This Agreement is between Acme Corp and Beta LLC.", "preamble")]
+    )
+    db_session.commit()
+    chunk = ChunkRepository(db_session).list_by_document(document.id)[0]
+
+    rows = _full_taxonomy_rows()
+    ClauseAnalysisRepository(db_session).replace_for_document(document.id, rows)
+    db_session.commit()
+
+    monkeypatch.setattr(
+        summary_service,
+        "get_llm_provider",
+        lambda: _FakeProvider(
+            json.dumps(
+                {
+                    "contract_type": "nda",
+                    "parties": [],
+                    "effective_date": None,
+                    "expiration_date": None,
+                    "key_obligations": [],
+                    "citations": [{"chunk_id": chunk.id, "quote": "This Agreement is between Acme Corp and Beta LLC."}],
+                }
+            )
+        ),
+    )
+
+    summary_service.summarize(db_session, document.id)
+    report = summary_service.get_full_report(db_session, document.id)
+
+    assert report["summary"].citations == [
+        {"chunk_id": chunk.id, "quote": "This Agreement is between Acme Corp and Beta LLC."}
+    ]

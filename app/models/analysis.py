@@ -64,6 +64,7 @@ class ContractSummary(Base):
     effective_date: Mapped[str | None] = mapped_column(String(100), nullable=True)
     expiration_date: Mapped[str | None] = mapped_column(String(100), nullable=True)
     key_obligations: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    citations: Mapped[list | None] = mapped_column(JSON, nullable=True)
     risk_summary_narrative: Mapped[str | None] = mapped_column(Text, nullable=True)
     risk_counts: Mapped[dict] = mapped_column(JSON)
 
