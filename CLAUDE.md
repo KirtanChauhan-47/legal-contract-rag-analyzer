@@ -713,6 +713,52 @@ citations back (the preamble sentence naming WPT/Zynga, and the Initial
 Term sentence) via both `GET /summary` and `GET /full-report`; confirmed
 `full-report` still returns all 20 clause rows.
 
+**Sprint 8 — minimal Streamlit UI (not the original Sprint 8 hardening
+scope — see below).** `streamlit_app/app.py`, a single-file thin client
+over the existing FastAPI endpoints: no business logic, no direct DB/
+Chroma/LLM access, no new AI calls — every action is a plain `requests`
+call to an endpoint that already existed. Backend was not modified for
+this (no CORS changes needed either, since the HTTP calls originate
+server-side from the Streamlit process, not from browser JS).
+
+Sidebar: backend URL (default `http://127.0.0.1:8000`), file upload
+(`POST /documents/upload`), a document picker (`GET /documents`), and one
+button per pipeline step (Process/Embed/Analyze Clauses/Summarize),
+disabled until a document is selected. Main area is four tabs: Overview
+(document metadata + last sidebar action's result), Ask Questions
+(`POST /ask`, answer + verified citations), Clause Analysis
+(`GET /clauses`, one expander per clause type with citations), and
+Contract Summary (`GET /summary`: contract type, parties, dates,
+obligations, risk counts as `st.metric`s, narrative, and Sprint 7.1's
+verified summary citations).
+
+A shared `_request()`/`api_get()`/`api_post()` helper maps every failure
+mode to a specific, non-crashing message: connection errors ("is uvicorn
+running?"), timeouts, and — parsed from the backend's own
+`{"error": {"code", "message"}}` shape — `conflict` (409, "workflow order
+issue"), `rate_limited` (429, includes `Retry-After` if present),
+`not_found` (404, e.g. no summary yet), and a generic fallback for
+anything else. "No document selected" is handled separately per tab
+(`st.info` prompt) rather than as an API error, since it's a UI-only
+precondition.
+
+**Verified:** `python -m py_compile` clean; then live end-to-end against
+a real running backend (`agreement_doc1.pdf`, documents 1 and 2) using
+`streamlit.testing.v1.AppTest` (headless, no browser available in this
+environment) — confirmed zero exceptions across: all four tabs rendering
+real data for an `analyzed` document (20 clause expanders with citations,
+full contract summary with citations, risk metrics matching persisted
+data); a real grounded Ask answer + citations against a document still at
+`embedded` status; "no document selected" showing info prompts instead of
+errors; a bad backend URL showing the connection-error message on every
+tab instead of crashing; and a missing summary showing the `not_found`
+message. One genuine pre-existing backend behavior was surfaced by this
+testing (not introduced by the UI, not fixed, since backend changes were
+out of scope): `qa_service.ask()` requires status to be exactly
+`embedded`, so `/ask` 409s once a document has advanced to `analyzed` via
+`/analyze-clauses` — the UI correctly shows this as a "workflow order
+issue" warning rather than crashing; see README's Current Limitations.
+
 **All 8 planned sprints are now complete.** Remaining open items are
 Sprint 8-style hardening/polish, not new features — see the "Known
 limitations" notes throughout this file (no `DELETE /documents/{id}`

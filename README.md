@@ -12,15 +12,16 @@ content it wasn't shown.
 
 ## Current status
 
-**All 8 planned sprints are complete** (plus 5.1, 6.1, and 6.1.1 hardening
-passes). The full pipeline works end-to-end: upload → extract →
-gate/clean/chunk → embed → hybrid search → grounded Q&A with citations and
-chat history → clause-level detection and risk analysis across a fixed
-20-clause taxonomy → contract-type classification, parties/dates
-extraction, and a code-computed risk rollup with a short LLM narrative.
-What's left is Sprint-8-style hardening/polish (a `DELETE` endpoint, auth,
-more automated edge-case tests), not new features — see `CLAUDE.md` for
-the full sprint history and known limitations.
+**All 8 planned sprints are complete** (plus 5.1, 6.1, 6.1.1, and 7.1
+hardening passes), plus a minimal Streamlit UI (see below). The full
+pipeline works end-to-end: upload → extract → gate/clean/chunk → embed →
+hybrid search → grounded Q&A with citations and chat history →
+clause-level detection and risk analysis across a fixed 20-clause
+taxonomy → contract-type classification, parties/dates extraction, and a
+code-computed risk rollup with a short LLM narrative. What's left is
+Sprint-8-style hardening/polish (a `DELETE` endpoint, auth, more automated
+edge-case tests), not new features — see `CLAUDE.md` for the full sprint
+history and known limitations.
 
 ## Pipeline
 
@@ -62,8 +63,9 @@ called out of order — e.g. you can't `/embed` a document that hasn't been
 | GET | `/documents/{id}/summary` | Fetch the persisted contract summary |
 | GET | `/documents/{id}/full-report` | Document metadata + summary + all clause analyses in one response |
 
-All endpoints are testable directly via Swagger UI at `/docs` — no frontend
-exists or is planned for the near term.
+All endpoints are testable directly via Swagger UI at `/docs`. A minimal
+Streamlit UI is also available (see "Streamlit UI" below) as a thin client
+over these same endpoints — it contains no business logic of its own.
 
 ## Hybrid retrieval design
 
@@ -167,6 +169,34 @@ The first request that touches embeddings will download the
 `all-MiniLM-L6-v2` model (~90MB) from Hugging Face — this needs internet
 access once, then it's cached locally.
 
+## Streamlit UI
+
+A minimal frontend (`streamlit_app/app.py`) for exercising the API without
+Swagger — upload/select a document, run each pipeline step, ask questions,
+and browse clause analysis and the contract summary. It's a thin client
+only: every action is a plain HTTP call to the FastAPI backend above, no
+business logic or AI calls live in the Streamlit process itself.
+
+Run the backend and the UI in two separate terminals:
+
+```bash
+# Terminal 1
+uvicorn app.main:app --reload
+
+# Terminal 2
+streamlit run streamlit_app/app.py
+```
+
+Then open the URL Streamlit prints (typically http://localhost:8501).
+Enter the backend URL in the sidebar (defaults to `http://127.0.0.1:8000`)
+if you're running the API on a different host/port.
+
+Typical flow: upload a contract in the sidebar (or select a previously
+uploaded one) → click Process → Embed → Analyze Clauses → Summarize, in
+that order (each button is a direct call to the matching endpoint, so
+running one out of order surfaces the same 409 you'd get from Swagger) →
+explore the Overview/Ask Questions/Clause Analysis/Contract Summary tabs.
+
 ## Run the tests
 
 ```bash
@@ -260,6 +290,18 @@ exactly this kind of manual testing — see `resources/README.md`.
 - **No `DELETE /documents/{id}` endpoint yet** — no way to remove a
   document's SQL rows, Chroma vectors, and uploaded file together
   (Sprint 8 item).
+- **`/ask` requires a document's status to be exactly `embedded`** — once
+  `/analyze-clauses` has run and advanced status to `analyzed`, `/ask`
+  returns a 409 rather than continuing to allow Q&A. Discovered while
+  manually testing the Streamlit UI's Ask tab; pre-existing backend
+  behavior (`app/services/qa_service.py`), not something introduced by the
+  UI, and left unchanged since fixing the status machine itself was out of
+  scope for the UI work. The Streamlit UI surfaces this as a clear
+  "workflow order issue" warning rather than a crash, same as any other
+  409 from any endpoint.
+- **The Streamlit UI is a thin, unauthenticated client** with no session
+  isolation between browser tabs beyond Streamlit's own per-session state
+  — fine for local single-user use, not intended as a multi-user frontend.
 
 ## Project layout
 

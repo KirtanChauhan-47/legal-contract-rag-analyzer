@@ -20,3 +20,7 @@ groq
 # --- Sprint 5.1/6.1.1 hardening: testing ---
 pytest
 httpx  # required by fastapi.testclient.TestClient for HTTP-level tests
+
+# --- Sprint 8: minimal Streamlit UI ---
+streamlit
+requests
