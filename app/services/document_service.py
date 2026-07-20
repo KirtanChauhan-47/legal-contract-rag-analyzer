@@ -78,7 +78,7 @@ def process_document(db: Session, document_id: int) -> Document:
     if document.status == DocumentStatus.FAILED.value:
         raise ConflictError(f"Document {document_id} failed extraction: {document.error_message}")
 
-    gate_result = contract_gate_service.run_gate(document.raw_text)
+    gate_result = contract_gate_service.run_gate(db, document.id, document.raw_text)
     document.is_legal_contract = gate_result.is_contract
     document.rejection_reason = None if gate_result.is_contract else gate_result.reason
     if gate_result.contract_type:

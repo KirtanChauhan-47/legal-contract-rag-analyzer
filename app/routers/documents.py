@@ -5,8 +5,9 @@ from app.db.session import get_db
 from app.schemas.chunk import ChunkRead, ChunkSearchResult
 from app.schemas.clause import ClauseAnalysisRead
 from app.schemas.document import DocumentListItem, DocumentRead, DocumentUploadResponse
+from app.schemas.status import DocumentStatusRead
 from app.schemas.summary import ContractSummaryRead, FullReportRead
-from app.services import clause_service, document_service, summary_service
+from app.services import clause_service, document_service, status_service, summary_service
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -38,6 +39,11 @@ def get_document(
     if not include_text:
         data.raw_text = None
     return data
+
+
+@router.get("/{document_id}/status", response_model=DocumentStatusRead)
+def get_document_status(document_id: int, db: Session = Depends(get_db)):
+    return status_service.get_document_status(db, document_id)
 
 
 @router.post("/{document_id}/process", response_model=DocumentRead)

@@ -96,11 +96,13 @@ app/
 ├── core/                    # config.py, exceptions.py, error_handlers.py, logging_config.py,
 │                             # clause_taxonomy.py  (auth.py lands later, if ever requested)
 ├── db/                       # base.py (engine/Base), session.py (get_db), init_db.py, repository.py,
-│                               # chunk_repository.py, chat_repository.py, analysis_repository.py
-├── models/                    # document.py, chunk.py, chat.py, analysis.py (ClauseAnalysis)
-├── schemas/                    # document.py, chunk.py, qa.py, clause.py  (summary.py lands Sprint 7)
-├── routers/                     # health.py, documents.py (upload/process/embed/search/clauses),
-│                                  # qa.py (ask/chat)
+│                               # chunk_repository.py, chat_repository.py, analysis_repository.py,
+│                               # usage_repository.py (TokenUsageLog)
+├── models/                    # document.py, chunk.py, chat.py, analysis.py (ClauseAnalysis,
+│                               # ClauseAnalysisRun, ContractSummary), usage.py (TokenUsageLog)
+├── schemas/                    # document.py, chunk.py, qa.py, clause.py, summary.py, status.py
+├── routers/                     # health.py, documents.py (upload/process/embed/search/clauses/
+│                                  # status/summarize/full-report), qa.py (ask/chat)
 ├── services/                      # llm_service.py (LLMProvider interface + StubLLMProvider +
 │                                    # GroqLLMProvider), extraction_service.py, document_service.py
 │                                    # (upload/process/embed/search orchestration),
@@ -110,14 +112,18 @@ app/
 │                                    # retrieve() + is_relevant(), shared by search/ask/clauses),
 │                                    # citation_verification.py (shared JSON-parsing + citation
 │                                    # verification, used by qa_service and clause_service),
-│                                    # qa_service.py, clause_service.py
-├── prompts/                        # contract_gate_prompt.py, qa_prompt.py, clause_detection_prompt.py
+│                                    # qa_service.py, clause_service.py, summary_service.py,
+│                                    # token_usage_service.py (per-action LLM cost logging),
+│                                    # status_service.py (read-only pipeline/cost rollup)
+├── prompts/                        # contract_gate_prompt.py, qa_prompt.py, clause_detection_prompt.py,
+│                                    # summary_prompt.py
 └── utils/                           # file_validation.py
 ```
 
-`app/db/chunk_repository.py`, `chat_repository.py`, and `analysis_repository.py`
-each hold model-specific queries (list-by-document, replace-for-document),
-kept out of the generic `Repository` per its own docstring.
+`app/db/chunk_repository.py`, `chat_repository.py`, `analysis_repository.py`,
+and `usage_repository.py` each hold model-specific queries (list-by-document,
+replace-for-document), kept out of the generic `Repository` per its own
+docstring.
 
 Note: `document_service.py` isn't named in the original sprint plan but follows
 directly from the stated layering rule (routers thin, services orchestrate) —
@@ -766,3 +772,71 @@ yet, no auth/rate limiting, extraction/gate/chunking edge cases are
 manually- not automatically-tested, Chroma vector-upsert idempotency has
 no automated test, the relevance gate's short-alias weakness is recorded
 but not fixed, and the PDF font-encoding artifact is unaddressed).
+
+## Post-Sprint-8 feature: pipeline status + token-cost visibility
+
+`GET /documents/{id}/status` reports, in one call: which pipeline stages
+have actually completed for a document (extracted, gate-checked +
+`is_legal_contract`/`rejection_reason`, chunked + chunk count, embedded,
+clause-analyzed + count against the full 20-type taxonomy, summarized),
+plus cumulative LLM token usage broken down by action
+(`contract_gate`/`qa_ask`/`analyze_clauses`/`summarize_extraction`/
+`summarize_narrative`) and as a grand total — so a user can see exactly
+what's been run on a document and what it has cost before deciding to
+run (or re-run, e.g. `force=true`) another step.
+
+**Design:** a new append-only `TokenUsageLog` table
+(`app/models/usage.py`, `app/db/usage_repository.py`) gets one row per
+real LLM call, written by a shared `token_usage_service.log_usage(db,
+document_id, action=..., provider=...)` called from all four existing
+LLM call sites (`contract_gate_service._confirm_with_llm`,
+`qa_service.ask`, `clause_service._analyze_one_clause`,
+`summary_service._extract_contract_details` and
+`_generate_risk_narrative`). Rows are never replaced/deleted on re-run
+(unlike `ClauseAnalysis`/`ContractSummary`) — tokens already spent stay
+counted regardless of what happens afterward, and each `Repository.
+create()` call commits immediately, so a log entry survives even if a
+later step in the same request fails.
+
+`LLMProvider` gained an optional `last_usage` attribute (not a changed
+`generate()` return type) that implementations set to `{"prompt_tokens",
+"completion_tokens", "total_tokens"}` after a real call —
+`GroqLLMProvider` populates it from the Groq SDK's `response.usage`;
+`StubLLMProvider` and every fake/stub provider used throughout the test
+suite simply never set it, and `log_usage()` no-ops (rather than logging
+fabricated zeros) whenever it's absent. This was a deliberate choice over
+changing `generate()`'s signature specifically so the ~15 fake-provider
+classes across `tests/test_clause_service.py`, `test_qa_service.py`,
+`test_summary_service.py`, and `test_http_error_handling.py` needed zero
+changes — confirmed by running the full suite unchanged after this
+change (52/52 still passing).
+
+`status_service.py` is pure read-side reporting — it runs no pipeline
+step and calls no LLM itself, just rolls up `Document.status`, chunk/
+clause/summary row existence, and `TokenUsageLog` rows already in the
+DB. `contract_gate_service.run_gate()`'s signature changed to take
+`(db, document_id, text)` instead of just `text`, threading through to
+`document_service.process_document`'s one call site, so the (rare,
+ambiguous-score-only) gate-confirmation LLM call can log usage too.
+
+**Verified live** against the running dev server (real Groq key): asked
+a real question against document 4 (`/ask`) and confirmed
+`/documents/4/status` immediately showed `total_llm_calls: 1` with real
+prompt/completion/total token counts under `by_action.qa_ask`; then ran
+`/analyze-clauses` on the same document and polled `/status` mid-run,
+observing the `analyze_clauses` bucket's call count and token totals grow
+in real time (12 of 20 calls logged while the request was still in
+flight) before settling at exactly 20 calls once `clauses_analyzed`
+flipped to `true` and `current_status` advanced to `analyzed` — direct
+confirmation that per-call logging is genuinely incremental and commits
+independently of the parent action's success. Also noticed (not
+introduced or fixed by this pass, pre-existing dev-DB state) that
+document 2 shows `current_status: "embedded"` despite having a full set
+of 20 clause analyses and a summary already persisted — a real
+artifact of an earlier re-embed happening after analysis during prior
+sprints' testing (re-embedding unconditionally resets `status` to
+`embedded`), which this new endpoint now makes directly visible instead
+of silently invisible.
+
+Full automated suite re-run after all changes: 52/52 passing, no test
+changes required.

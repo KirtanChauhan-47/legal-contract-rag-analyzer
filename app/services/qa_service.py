@@ -13,7 +13,7 @@ from app.db.chat_repository import ChatMessageRepository, ChatSessionRepository
 from app.models.chat import ChatMessage
 from app.models.document import DocumentStatus
 from app.prompts.qa_prompt import SYSTEM_PROMPT, build_qa_prompt
-from app.services import document_service, retrieval_service
+from app.services import document_service, retrieval_service, token_usage_service
 from app.services.citation_verification import parse_llm_json, verify_citations
 from app.services.llm_service import get_llm_provider
 
@@ -61,6 +61,7 @@ def ask(db: Session, document_id: int, question: str, session_uuid: str | None) 
         prompt = build_qa_prompt(question, chunks)
         provider = get_llm_provider()
         raw_response = provider.generate(prompt, system=SYSTEM_PROMPT)
+        token_usage_service.log_usage(db, document_id, action=token_usage_service.ACTION_QA_ASK, provider=provider)
         answer_text, verified_citations = _parse_and_verify(raw_response, chunks)
         if not verified_citations:
             logger.info(

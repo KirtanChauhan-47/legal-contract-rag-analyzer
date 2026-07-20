@@ -38,7 +38,7 @@ from app.models.analysis import ClauseAnalysis
 from app.models.chunk import Chunk
 from app.models.document import DocumentStatus
 from app.prompts.clause_detection_prompt import PROMPT_VERSION, SYSTEM_PROMPT, build_clause_prompt
-from app.services import document_service, embedding_service, retrieval_service
+from app.services import document_service, embedding_service, retrieval_service, token_usage_service
 from app.services.citation_verification import parse_llm_json, quote_appears_in, verify_citations
 from app.services.llm_service import get_llm_provider
 
@@ -241,6 +241,9 @@ def _analyze_one_clause(db: Session, document_id: int, clause_type: ClauseType) 
 
     provider = get_llm_provider()
     raw_response = provider.generate(prompt, system=SYSTEM_PROMPT)
+    token_usage_service.log_usage(
+        db, document_id, action=token_usage_service.ACTION_ANALYZE_CLAUSES, provider=provider
+    )
 
     return _parse_clause_response(raw_response, prompt_chunks, clause_type)
 

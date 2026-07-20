@@ -11,6 +11,17 @@ from app.core.exceptions import RateLimitedError
 
 
 class LLMProvider(abc.ABC):
+    # Implementations that can report token usage should set this to
+    # {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}
+    # after each generate() call, so callers can log per-action cost via
+    # token_usage_service.log_usage(). Left as None (unknown) by providers
+    # that can't report usage -- e.g. StubLLMProvider and every fake
+    # provider used in the test suite -- in which case log_usage() no-ops
+    # rather than logging fabricated zeros. Left as a plain attribute
+    # (not a changed generate() return type) so existing callers/tests
+    # don't need to change.
+    last_usage: dict | None = None
+
     @abc.abstractmethod
     def generate(self, prompt: str, *, system: str | None = None) -> str:
         """Return a text completion for the given prompt."""
@@ -65,6 +76,17 @@ class GroqLLMProvider(LLMProvider):
                 "later, or configure a different provider/model.",
                 retry_after_seconds=_extract_retry_after_seconds(exc),
             ) from exc
+
+        usage = getattr(response, "usage", None)
+        self.last_usage = (
+            {
+                "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+                "total_tokens": getattr(usage, "total_tokens", 0) or 0,
+            }
+            if usage is not None
+            else None
+        )
 
         return response.choices[0].message.content
 

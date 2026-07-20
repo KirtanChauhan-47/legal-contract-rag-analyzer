@@ -22,7 +22,7 @@ from app.prompts.summary_prompt import (
     build_extraction_prompt,
     build_narrative_prompt,
 )
-from app.services import document_service
+from app.services import document_service, token_usage_service
 from app.services.citation_verification import parse_llm_json, verify_citations
 from app.services.llm_service import get_llm_provider
 
@@ -55,10 +55,10 @@ def summarize(db: Session, document_id: int) -> ContractSummary:
         )
 
     extraction_chunks = _gather_extraction_chunks(db, document_id, clause_rows)
-    extraction = _extract_contract_details(extraction_chunks)
+    extraction = _extract_contract_details(db, document_id, extraction_chunks)
 
     risk_counts = _compute_risk_counts(clause_rows)
-    narrative = _generate_risk_narrative(risk_counts, clause_rows)
+    narrative = _generate_risk_narrative(db, document_id, risk_counts, clause_rows)
 
     fields = {
         "contract_type": extraction["contract_type"],
@@ -144,13 +144,16 @@ def _default_extraction() -> dict:
     }
 
 
-def _extract_contract_details(chunks: list[dict]) -> dict:
+def _extract_contract_details(db: Session, document_id: int, chunks: list[dict]) -> dict:
     if not chunks:
         return _default_extraction()
 
     prompt = build_extraction_prompt(chunks)
     provider = get_llm_provider()
     raw_response = provider.generate(prompt, system=EXTRACTION_SYSTEM_PROMPT)
+    token_usage_service.log_usage(
+        db, document_id, action=token_usage_service.ACTION_SUMMARIZE_EXTRACTION, provider=provider
+    )
 
     return _parse_extraction_response(raw_response, chunks)
 
@@ -232,7 +235,7 @@ def _compute_risk_counts(clause_rows) -> dict:
     return counts
 
 
-def _generate_risk_narrative(risk_counts: dict, clause_rows) -> str:
+def _generate_risk_narrative(db: Session, document_id: int, risk_counts: dict, clause_rows) -> str:
     high_risk_clauses = [
         {"clause_type": row.clause_type, "risk_explanation": row.risk_explanation}
         for row in clause_rows
@@ -244,6 +247,9 @@ def _generate_risk_narrative(risk_counts: dict, clause_rows) -> str:
     try:
         provider = get_llm_provider()
         raw_response = provider.generate(prompt, system=NARRATIVE_SYSTEM_PROMPT)
+        token_usage_service.log_usage(
+            db, document_id, action=token_usage_service.ACTION_SUMMARIZE_NARRATIVE, provider=provider
+        )
     except (RateLimitedError, NotImplementedError) as exc:
         # The narrative is a cheap embellishment on top of already-solid,
         # code-computed risk_counts -- not worth failing the whole summary

@@ -15,7 +15,10 @@ import json
 import logging
 import re
 
+from sqlalchemy.orm import Session
+
 from app.prompts.contract_gate_prompt import build_gate_prompt
+from app.services import token_usage_service
 from app.services.llm_service import get_llm_provider
 
 logger = logging.getLogger(__name__)
@@ -55,7 +58,7 @@ def _heuristic_score(text: str) -> int:
     return sum(1 for pattern in SIGNAL_PATTERNS if re.search(pattern, text, re.IGNORECASE | re.MULTILINE))
 
 
-def run_gate(text: str) -> GateResult:
+def run_gate(db: Session, document_id: int, text: str) -> GateResult:
     if len(text.strip()) < MIN_TEXT_LENGTH:
         return GateResult(False, "Document text is too short to plausibly be a contract.")
 
@@ -66,14 +69,17 @@ def run_gate(text: str) -> GateResult:
     if score <= REJECT_THRESHOLD:
         return GateResult(False, f"Heuristic pre-filter matched only {score} contract signal(s).")
 
-    return _confirm_with_llm(text, score)
+    return _confirm_with_llm(db, document_id, text, score)
 
 
-def _confirm_with_llm(text: str, heuristic_score: int) -> GateResult:
+def _confirm_with_llm(db: Session, document_id: int, text: str, heuristic_score: int) -> GateResult:
     excerpt = text[:EXCERPT_CHARS_FOR_LLM]
     try:
         provider = get_llm_provider()
         raw_response = provider.generate(build_gate_prompt(excerpt))
+        token_usage_service.log_usage(
+            db, document_id, action=token_usage_service.ACTION_CONTRACT_GATE, provider=provider
+        )
         return _parse_llm_response(raw_response)
     except NotImplementedError:
         accepted = heuristic_score >= (ACCEPT_THRESHOLD + REJECT_THRESHOLD) // 2
